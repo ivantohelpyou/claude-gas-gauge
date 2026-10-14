@@ -3,7 +3,7 @@
 **A fuel gauge for Claude Code.** One line under the prompt, after every message:
 
 ```
-$13.90 · 5h 17% · 7d 4% · ctx 42% · fable-5-1
+$13.90 · 5h 17% · 7d 4% · context 42% · fable-5-1
 ```
 
 What the session would cost at API rates so far, how much of the plan's five-hour and seven-day
@@ -41,7 +41,7 @@ at https://code.claude.com/docs/en/statusline.
 | `$13.90` | the session's cost so far at API list price (`cost.total_cost_usd`): a price, not a bill, if you are on a flat plan | compare sessions; log it; notice when one runs away |
 | `5h 17%` | the plan's five-hour rolling window, used | past 80% with hours to the reset: finish the turn, start nothing wide |
 | `7d 4%` | the plan's seven-day window, used; the binding constraint on a flat plan | pace it: a day is 14% of a week |
-| `ctx 42%` | how full the context window is; every later turn re-reads all of it | past 70%, a checkpoint and `/clear` is cheaper than ten more turns |
+| `context 42%` | how full the context window is; every later turn re-reads all of it | past 70%, a checkpoint and `/clear` is cheaper than ten more turns |
 | `fable-5-1` | the model answering | is it the one you meant? |
 
 The two windows appear only for claude.ai subscription accounts, and only after the first API
@@ -53,7 +53,7 @@ provides, so it is not on the line.
 The line is yours. Pick the segments and their order, and the separator, in the settings entry:
 
 ```json
-{ "statusLine": { "type": "command", "command": "gas-gauge --segments cost,7d,ctx --separator ' | '" } }
+{ "statusLine": { "type": "command", "command": "gas-gauge --segments cost,7d,context --separator ' | '" } }
 ```
 
 | Segment | Shows |
@@ -61,16 +61,26 @@ The line is yours. Pick the segments and their order, and the separator, in the 
 | `cost` | `$13.90` |
 | `5h` | `5h 17%` |
 | `7d` | `7d 4%` |
-| `ctx` | `ctx 42%` |
+| `context` | `context 42%` (`ctx` is accepted as an alias) |
 | `model` | `fable-5-1` |
 | `tokens` | `305k in / 4k out` |
 | `session` | the first eight characters of the session id |
 | `version` | `cc 2.1.299` |
 
-Default: `cost,5h,7d,ctx,model`. A segment with nothing to show is skipped, not left blank; a
+Default: `cost,5h,7d,context,model`. A segment with nothing to show is skipped, not left blank; a
 name this version does not know is ignored. `--dir PATH` moves the JSON files; `--no-file` prints
 the line and writes nothing. A bad flag prints nothing and exits 0: a status line must never break
 the prompt.
+
+## Colour
+
+The two windows are coloured by pace. A window being spent faster than time passes is dull
+yellow: on day one of the week, `7d 18%` is yellow, because a seventh of the week has gone and
+more than a seventh of it is spent. A window at 90% or more is red. The context segment is
+yellow from 70% and red from 85%. `--no-color` or `NO_COLOR` in the environment turns it off.
+
+The gauge is independent of everything else the author publishes. It does not need, know about
+or use the `ctx` context tool; the `context` segment is Claude Code's own context window.
 
 ## The file
 

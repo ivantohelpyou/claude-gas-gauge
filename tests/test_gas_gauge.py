@@ -54,7 +54,7 @@ class TestWrites:
     def test_writes_the_record_and_prints_a_line(self, tmp_path):
         result = run(json.dumps(payload()), tmp_path)
         assert result.returncode == 0, result.stderr
-        assert result.stdout.strip() == "$12.35 · 5h 23% · 7d 61% · ctx 42% · fable-5-1"
+        assert result.stdout.strip() == "$12.35 · 5h 23% · 7d 61% · context 42% · fable-5-1"
         record = json.loads(
             (tmp_path / ".claude" / "usage-sidecar" / f"{SID}.json").read_text()
         )
@@ -171,20 +171,20 @@ class TestNeverFails:
 
 class TestConfigurable:
     def test_default_line(self):
-        assert usage_sidecar.status_line(usage_sidecar.record_from(payload())) == "$12.35 · 5h 23% · 7d 61% · ctx 42% · fable-5-1"
+        assert usage_sidecar.status_line(usage_sidecar.record_from(payload()), color=False) == "$12.35 · 5h 23% · 7d 61% · context 42% · fable-5-1"
 
     def test_segments_in_the_order_given_with_a_separator(self):
         rec = usage_sidecar.record_from(payload())
-        assert usage_sidecar.status_line(rec, ["model", "cost", "tokens"], " | ") == "fable-5-1 | $12.35 | 500k in / 4k out"
+        assert usage_sidecar.status_line(rec, ["model", "cost", "tokens"], " | ", color=False) == "fable-5-1 | $12.35 | 500k in / 4k out"
 
     def test_unknown_segment_names_are_ignored_and_empty_segments_skipped(self):
         rec = usage_sidecar.record_from(payload(rate_limits={}))
-        assert usage_sidecar.status_line(rec, ["5h", "nonsense", "cost"]) == "$12.35"
+        assert usage_sidecar.status_line(rec, ["5h", "nonsense", "cost"], color=False) == "$12.35"
 
     def test_flags_reach_the_line_and_no_file_writes_nothing(self, tmp_path):
         env = {k: v for k, v in os.environ.items() if k not in (usage_sidecar.SIDECAR_DIR_ENV, usage_sidecar.LEGACY_DIR_ENV)}
         env["HOME"] = str(tmp_path)
-        r = subprocess.run([sys.executable, "-m", "gas_gauge", "--segments", "cost,7d", "--separator", " / ", "--no-file"],
+        r = subprocess.run([sys.executable, "-m", "gas_gauge", "--segments", "cost,7d", "--separator", " / ", "--no-file", "--no-color"],
                            input=json.dumps(payload()), env=env, capture_output=True, text=True, timeout=30, check=False)
         assert r.returncode == 0 and r.stdout.strip() == "$12.35 / 7d 61%"
         assert not (tmp_path / ".claude").exists()
@@ -199,3 +199,55 @@ class TestConfigurable:
     def test_a_bad_flag_never_breaks_the_prompt(self):
         r = subprocess.run([sys.executable, "-m", "gas_gauge", "--bogus"], input="{}", capture_output=True, text=True, timeout=30, check=False)
         assert r.returncode == 0
+
+
+class TestColourByPace:
+    """Dull yellow when a window is being spent faster than time passes; red when nearly empty."""
+    Y, R, X = usage_sidecar.YELLOW, usage_sidecar.RED, usage_sidecar.RESET
+
+    def _rec(self, five=None, seven=None, now=1_000_000.0):
+        limits = {}
+        if five is not None:
+            pct, elapsed = five
+            limits["five_hour"] = {"used_percentage": pct, "resets_at": now + (1 - elapsed) * 5 * 3600}
+        if seven is not None:
+            pct, elapsed = seven
+            limits["seven_day"] = {"used_percentage": pct, "resets_at": now + (1 - elapsed) * 7 * 86400}
+        return usage_sidecar.record_from(payload(rate_limits=limits)), now
+
+    def test_day_one_at_eighteen_percent_is_ahead_of_pace(self):
+        rec, now = self._rec(seven=(18, 1 / 7))          # 14% of the week gone, 18% spent
+        assert usage_sidecar.status_line(rec, ["7d"], now=now) == f"{self.Y}7d 18%{self.X}"
+
+    def test_on_pace_is_plain(self):
+        rec, now = self._rec(seven=(15, 1 / 7))          # within the 5-point margin
+        assert usage_sidecar.status_line(rec, ["7d"], now=now) == "7d 15%"
+        rec, now = self._rec(seven=(40, 0.5))
+        assert usage_sidecar.status_line(rec, ["7d"], now=now) == "7d 40%"
+
+    def test_nearly_empty_is_red_whatever_the_pace(self):
+        rec, now = self._rec(five=(92, 0.95))
+        assert usage_sidecar.status_line(rec, ["5h"], now=now) == f"{self.R}5h 92%{self.X}"
+
+    def test_five_hour_window_early_and_heavy_is_yellow(self):
+        rec, now = self._rec(five=(67, 0.3))             # 30% of the window gone, 67% spent
+        assert usage_sidecar.status_line(rec, ["5h"], now=now) == f"{self.Y}5h 67%{self.X}"
+
+    def test_context_colours_by_its_own_thresholds(self):
+        rec = usage_sidecar.record_from(payload(context_window={"used_percentage": 72}))
+        assert usage_sidecar.status_line(rec, ["context"]) == f"{self.Y}context 72%{self.X}"
+        rec = usage_sidecar.record_from(payload(context_window={"used_percentage": 90}))
+        assert usage_sidecar.status_line(rec, ["ctx"]) == f"{self.R}context 90%{self.X}"  # alias
+
+    def test_no_resets_at_means_no_pace_judgement(self):
+        rec = usage_sidecar.record_from(payload(rate_limits={"seven_day": {"used_percentage": 60}}))
+        assert usage_sidecar.status_line(rec, ["7d"]) == "7d 60%"
+
+    def test_no_color_env_and_flag(self, monkeypatch):
+        rec, now = self._rec(seven=(18, 1 / 7))
+        assert usage_sidecar.status_line(rec, ["7d"], now=now, color=False) == "7d 18%"
+        monkeypatch.setenv("NO_COLOR", "1")
+        env = {k: v for k, v in os.environ.items() if k not in (usage_sidecar.SIDECAR_DIR_ENV, usage_sidecar.LEGACY_DIR_ENV)}
+        r = subprocess.run([sys.executable, "-m", "gas_gauge", "--no-file"], input=json.dumps(payload()), env=env,
+                           capture_output=True, text=True, timeout=30, check=False)
+        assert "\033[" not in r.stdout

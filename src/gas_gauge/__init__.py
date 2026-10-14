@@ -4,7 +4,7 @@ gas-gauge — a Claude Code status line that shows what the session costs and wr
 Claude Code runs the statusLine command after every assistant message and pipes it a JSON
 object (docs: https://code.claude.com/docs/en/statusline). This prints one line:
 
-    $13.90 · 5h 17% · 7d 4% · ctx 42% · fable-5-1
+    $13.90 · 5h 17% · 7d 4% · context 42% · fable-5-1
 
 and writes the same numbers to ~/.claude/usage-sidecar/<session_id>.json ($GAS_GAUGE_DIR or
 $COST_SIDECAR_DIR overrides the folder), so your own tooling can read a session's cost without
@@ -134,16 +134,59 @@ def _seg_cost(r):
     return None if usd is None else f"${usd:,.2f}"
 
 
+# Colour: a window that is being spent faster than time passes is dull yellow; one close
+# to empty is red (Ivan, 2026-10-14: "5h 67% · 7d 18% means we're definitely spending more
+# than we should for day 1 of the week"). ANSI, which Claude Code renders in the status line.
+WINDOW_SECONDS = {"five_hour": 5 * 3600, "seven_day": 7 * 86400}
+AHEAD_MARGIN = 2.0     # percentage points past the elapsed share before a window turns yellow
+RED_AT = 90.0          # a window this full is nearly empty
+CTX_YELLOW_AT, CTX_RED_AT = 70.0, 85.0
+YELLOW, RED, RESET = "\033[33m", "\033[31m", "\033[0m"
+
+
+def elapsed_share(resets_at, seconds, now):
+    """How much of the window has passed, 0..1, from its reset time and length."""
+    if resets_at is None or now is None:
+        return None
+    start = resets_at - seconds
+    return max(0.0, min(1.0, (now - start) / seconds))
+
+
+def window_state(pct, resets_at, seconds, now):
+    """'red' near empty, 'yellow' when ahead of pace, else None."""
+    if pct is None:
+        return None
+    if pct >= RED_AT:
+        return "red"
+    share = elapsed_share(resets_at, seconds, now)
+    if share is not None and pct > share * 100.0 + AHEAD_MARGIN:
+        return "yellow"
+    return None
+
+
+def paint(text, state, color):
+    if not color or state is None:
+        return text
+    return (RED if state == "red" else YELLOW) + text + RESET
+
+
 def _seg_window(name, label):
-    def seg(r):
-        pct = (r.get("rate_limits") or {}).get(name, {}).get("used_percentage")
-        return None if pct is None else f"{label} {pct:.0f}%"
+    def seg(r, now=None, color=True):
+        win = (r.get("rate_limits") or {}).get(name, {})
+        pct = win.get("used_percentage")
+        if pct is None:
+            return None
+        state = window_state(pct, win.get("resets_at"), WINDOW_SECONDS[name], now)
+        return paint(f"{label} {pct:.0f}%", state, color)
     return seg
 
 
-def _seg_ctx(r):
+def _seg_ctx(r, now=None, color=True):
     pct = r.get("context_used_percentage")
-    return None if pct is None else f"ctx {pct:.0f}%"
+    if pct is None:
+        return None
+    state = "red" if pct >= CTX_RED_AT else "yellow" if pct >= CTX_YELLOW_AT else None
+    return paint(f"context {pct:.0f}%", state, color)
 
 
 def _seg_model(r):
@@ -173,25 +216,31 @@ SEGMENTS = {
     "cost": _seg_cost,
     "5h": _seg_window("five_hour", "5h"),
     "7d": _seg_window("seven_day", "7d"),
-    "ctx": _seg_ctx,
+    "context": _seg_ctx,
+    "ctx": _seg_ctx,  # alias; the gauge has nothing to do with the ctx tool, so the label says "context"
     "model": _seg_model,
     "tokens": _seg_tokens,
     "session": _seg_session,
     "version": _seg_version,
 }
-DEFAULT_SEGMENTS = ("cost", "5h", "7d", "ctx", "model")
+DEFAULT_SEGMENTS = ("cost", "5h", "7d", "context", "model")
 DEFAULT_SEPARATOR = " · "
 
 
-def status_line(record, segments=DEFAULT_SEGMENTS, separator=DEFAULT_SEPARATOR):
+COLOURED = {"5h", "7d", "context", "ctx"}
+
+
+def status_line(record, segments=DEFAULT_SEGMENTS, separator=DEFAULT_SEPARATOR, color=True, now=None):
     """The line, from the segments named, in that order. Unknown names are ignored, so a
-    settings entry written for a newer version still prints something on an older one."""
+    settings entry written for a newer version still prints something on an older one.
+    `now` (epoch seconds) is when the line is drawn; the windows are coloured by pace against it."""
+    now = time.time() if now is None else now
     parts = []
     for name in segments:
         seg = SEGMENTS.get(name)
         if seg is None:
             continue
-        text = seg(record)
+        text = seg(record, now, color) if name in COLOURED else seg(record)
         if text:
             parts.append(text)
     return separator.join(parts)
@@ -207,6 +256,7 @@ def parse_args(argv=None):
     ap.add_argument("--separator", default=None, help=f"between segments (default: {DEFAULT_SEPARATOR!r})")
     ap.add_argument("--dir", default=None, help="where the per-session JSON files go (default: ~/.claude/usage-sidecar, or $GAS_GAUGE_DIR)")
     ap.add_argument("--no-file", action="store_true", help="print the line only; write nothing")
+    ap.add_argument("--no-color", action="store_true", help="plain text (also: NO_COLOR in the environment)")
     return ap.parse_args(argv)
 
 
@@ -225,7 +275,8 @@ def main(argv=None):
         if not args.no_file:
             write_record(record, Path(args.dir).expanduser() if args.dir else sidecar_root())
         segments = [p.strip() for p in args.segments.split(",") if p.strip()] if args.segments else DEFAULT_SEGMENTS
-        line = status_line(record, segments, args.separator if args.separator is not None else DEFAULT_SEPARATOR)
+        color = not args.no_color and not os.environ.get("NO_COLOR")
+        line = status_line(record, segments, args.separator if args.separator is not None else DEFAULT_SEPARATOR, color=color)
         if line:
             print(line)
     except Exception:  # noqa: BLE001 - a status line must never fail
