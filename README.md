@@ -3,10 +3,10 @@
 **A fuel gauge for Claude Code.** One line under the prompt, after every message:
 
 ```
-$13.90 · 5h 17% · 7d 4% · context 42% · fable-5-1
+webshop · $13.90 · 5h 17% · 7d 4% · ctx 42% · fable-5-1
 ```
 
-What the session would cost at API rates so far, how much of the plan's five-hour and seven-day
+Which project the session is in, what the session would cost at API rates so far, how much of the plan's five-hour and seven-day
 windows is used, how full the context window is, and which model is answering. The same numbers
 go to a small JSON file per session, so your own tooling can read what a session cost without
 anyone pasting `/usage` into anything.
@@ -38,10 +38,11 @@ at https://code.claude.com/docs/en/statusline.
 
 | Segment | Meaning | What to do with it |
 |---|---|---|
+| `webshop` | the project the session is in (see `--root` below) | is this the window you meant to type into? |
 | `$13.90` | the session's cost so far at API list price (`cost.total_cost_usd`): a price, not a bill, if you are on a flat plan | compare sessions; log it; notice when one runs away |
 | `5h 17%` | the plan's five-hour rolling window, used | past 80% with hours to the reset: finish the turn, start nothing wide |
 | `7d 4%` | the plan's seven-day window, used; the binding constraint on a flat plan | pace it: a day is 14% of a week |
-| `context 42%` | how full the context window is; every later turn re-reads all of it | past 70%, a checkpoint and `/clear` is cheaper than ten more turns |
+| `ctx 42%` | how full the context window is; every later turn re-reads all of it | past 70%, a checkpoint and `/clear` is cheaper than ten more turns |
 | `fable-5-1` | the model answering | is it the one you meant? |
 
 The two windows appear only for claude.ai subscription accounts, and only after the first API
@@ -58,17 +59,25 @@ The line is yours. Pick the segments and their order, and the separator, in the 
 
 | Segment | Shows |
 |---|---|
+| `where` | `webshop`, `webshop/fix-login` |
 | `cost` | `$13.90` |
 | `5h` | `5h 17%` |
 | `7d` | `7d 4%` |
-| `context` | `context 42%` (`ctx` is accepted as an alias) |
+| `context` | `ctx 42%` (`ctx` is accepted as a name too) |
 | `model` | `fable-5-1` |
 | `tokens` | `305k in / 4k out` |
 | `session` | the first eight characters of the session id |
 | `version` | `cc 2.1.299` |
 
-Default: `cost,5h,7d,context,model`. A segment with nothing to show is skipped, not left blank; a
-name this version does not know is ignored. `--dir PATH` moves the JSON files; `--no-file` prints
+Default: `where,cost,5h,7d,context,model`. A segment with nothing to show is skipped, not left blank; a
+name this version does not know is ignored.
+
+`where` names the git repository the session's folder is in, or the folder itself outside one.
+If your projects live under one folder, pass it as `--root` (or set `GAS_GAUGE_ROOT`): the
+segment then names the first folder below it, plus the worktree when the path runs through
+a folder named `.worktrees` (the layout where a project keeps its git worktrees at
+`<project>/.worktrees/<name>`; other layouts just show the project). With `--root ~/code`, `~/code/webshop/src` is `webshop` and
+`~/code/webshop/.worktrees/fix-login` is `webshop/fix-login`. `--dir PATH` moves the JSON files; `--no-file` prints
 the line and writes nothing. A bad flag prints nothing and exits 0: a status line must never break
 the prompt.
 
@@ -76,7 +85,7 @@ the prompt.
 
 The two windows are coloured by pace. A window being spent faster than time passes is dull
 yellow: on day one of the week, `7d 18%` is yellow, because a seventh of the week has gone and
-more than a seventh of it is spent. A window at 90% or more is red. The context segment is
+more than a seventh of it is spent. A window at 90% or more is red. The `ctx` segment is
 yellow from 70% and red from 85%. `--no-color` or `NO_COLOR` in the environment turns it off.
 
 The gauge is independent of everything else the author publishes. It does not need, know about
@@ -112,6 +121,20 @@ file) and restarts from zero when a session is resumed (same id); the file keeps
 figure any run wrote as `peak_total_cost_usd`, so price a session at the higher of the two. And
 the first message after a resume carries no cost yet; a null never overwrites a number already
 on file.
+
+## A second row
+
+Claude Code draws every line the command prints, and re-runs it every `refreshInterval`
+seconds as well as after each message. So another script's line can sit under the gauge and
+keep moving while the session is idle, for instance a row for whatever long job is running:
+
+```json
+{ "statusLine": { "type": "command", "refreshInterval": 15,
+                  "command": "in=$(cat); printf %s \"$in\" | gas-gauge; printf %s \"$in\" | your-jobs-script" } }
+```
+
+Both get the same JSON, so the second script can read `session_id` and tell this session's work
+from everyone else's. It should print nothing when it has nothing to say.
 
 What you build on the file is up to you. The author's own ledger reads it to give every session a
 row, charged to the work it did.

@@ -4,7 +4,7 @@ gas-gauge — a Claude Code status line that shows what the session costs and wr
 Claude Code runs the statusLine command after every assistant message and pipes it a JSON
 object (docs: https://code.claude.com/docs/en/statusline). This prints one line:
 
-    $13.90 · 5h 17% · 7d 4% · context 42% · fable-5-1
+    webshop · $13.90 · 5h 17% · 7d 4% · ctx 42% · fable-5-1
 
 and writes the same numbers to ~/.claude/usage-sidecar/<session_id>.json ($GAS_GAUGE_DIR or
 $COST_SIDECAR_DIR overrides the folder), so your own tooling can read a session's cost without
@@ -186,7 +186,47 @@ def _seg_ctx(r, now=None, color=True):
     if pct is None:
         return None
     state = "red" if pct >= CTX_RED_AT else "yellow" if pct >= CTX_YELLOW_AT else None
-    return paint(f"context {pct:.0f}%", state, color)
+    return paint(f"ctx {pct:.0f}%", state, color)
+
+
+ROOT_ENV = "GAS_GAUGE_ROOT"
+
+
+def where(cwd, root=None):
+    """Which project the session is in, from its working directory.
+
+    Under `root` (a folder of projects, e.g. ~/code): the first folder below it, plus the
+    worktree name when the path runs through `.worktrees/<name>`, so `~/code/webshop/src`
+    is `webshop` and `~/code/webshop/.worktrees/fix-login` is `webshop/fix-login`; the root itself is its
+    own name. Anywhere else: the nearest folder holding a `.git`, else the folder itself."""
+    if not isinstance(cwd, str) or not cwd:
+        return None
+    path = Path(cwd)
+    if root:
+        base = Path(root).expanduser()
+        parts = None
+        try:
+            parts = path.relative_to(base).parts
+        except ValueError:
+            try:  # one side reached through a symlink
+                parts = path.resolve().relative_to(base.resolve()).parts
+            except (ValueError, OSError):
+                pass
+        if parts is not None:
+            if not parts:
+                return base.name or str(base)
+            if ".worktrees" in parts:
+                i = parts.index(".worktrees")
+                if i + 1 < len(parts):
+                    return f"{parts[0]}/{parts[i + 1]}" if i else parts[i + 1]
+            return parts[0]
+    try:
+        for folder in (path, *path.parents):
+            if (folder / ".git").exists():
+                return folder.name or str(folder)
+    except OSError:
+        pass
+    return path.name or str(path)
 
 
 def _seg_model(r):
@@ -213,34 +253,40 @@ def _seg_version(r):
 
 
 SEGMENTS = {
+    "where": None,  # needs the root; drawn in status_line
     "cost": _seg_cost,
     "5h": _seg_window("five_hour", "5h"),
     "7d": _seg_window("seven_day", "7d"),
     "context": _seg_ctx,
-    "ctx": _seg_ctx,  # alias; the gauge has nothing to do with the ctx tool, so the label says "context"
+    "ctx": _seg_ctx,  # the same segment by its label
     "model": _seg_model,
     "tokens": _seg_tokens,
     "session": _seg_session,
     "version": _seg_version,
 }
-DEFAULT_SEGMENTS = ("cost", "5h", "7d", "context", "model")
+DEFAULT_SEGMENTS = ("where", "cost", "5h", "7d", "context", "model")
 DEFAULT_SEPARATOR = " · "
 
 
 COLOURED = {"5h", "7d", "context", "ctx"}
 
 
-def status_line(record, segments=DEFAULT_SEGMENTS, separator=DEFAULT_SEPARATOR, color=True, now=None):
+def status_line(record, segments=DEFAULT_SEGMENTS, separator=DEFAULT_SEPARATOR, color=True, now=None, root=None):
     """The line, from the segments named, in that order. Unknown names are ignored, so a
     settings entry written for a newer version still prints something on an older one.
-    `now` (epoch seconds) is when the line is drawn; the windows are coloured by pace against it."""
+    `now` (epoch seconds) is when the line is drawn; the windows are coloured by pace against it.
+    `root` is the folder of projects the `where` segment names a project in."""
     now = time.time() if now is None else now
     parts = []
     for name in segments:
-        seg = SEGMENTS.get(name)
-        if seg is None:
+        if name not in SEGMENTS:
             continue
-        text = seg(record, now, color) if name in COLOURED else seg(record)
+        if name == "where":
+            text = where(record.get("cwd"), root)
+        elif name in COLOURED:
+            text = SEGMENTS[name](record, now, color)
+        else:
+            text = SEGMENTS[name](record)
         if text:
             parts.append(text)
     return separator.join(parts)
@@ -255,6 +301,8 @@ def parse_args(argv=None):
                     help="comma-separated, in order; any of " + ", ".join(SEGMENTS) + f" (default: {','.join(DEFAULT_SEGMENTS)})")
     ap.add_argument("--separator", default=None, help=f"between segments (default: {DEFAULT_SEPARATOR!r})")
     ap.add_argument("--dir", default=None, help="where the per-session JSON files go (default: ~/.claude/usage-sidecar, or $GAS_GAUGE_DIR)")
+    ap.add_argument("--root", default=None,
+                    help=f"a folder of projects; `where` names the project under it (default: ${ROOT_ENV})")
     ap.add_argument("--no-file", action="store_true", help="print the line only; write nothing")
     ap.add_argument("--no-color", action="store_true", help="plain text (also: NO_COLOR in the environment)")
     return ap.parse_args(argv)
@@ -276,7 +324,9 @@ def main(argv=None):
             write_record(record, Path(args.dir).expanduser() if args.dir else sidecar_root())
         segments = [p.strip() for p in args.segments.split(",") if p.strip()] if args.segments else DEFAULT_SEGMENTS
         color = not args.no_color and not os.environ.get("NO_COLOR")
-        line = status_line(record, segments, args.separator if args.separator is not None else DEFAULT_SEPARATOR, color=color)
+        root = args.root or os.environ.get(ROOT_ENV) or None
+        line = status_line(record, segments, args.separator if args.separator is not None else DEFAULT_SEPARATOR,
+                           color=color, root=root)
         if line:
             print(line)
     except Exception:  # noqa: BLE001 - a status line must never fail

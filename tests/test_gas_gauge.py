@@ -36,7 +36,8 @@ def payload(**over):
 
 
 def run(stdin, home, extra_env=None):
-    env = {k: v for k, v in os.environ.items() if k not in (usage_sidecar.SIDECAR_DIR_ENV, usage_sidecar.LEGACY_DIR_ENV)}
+    env = {k: v for k, v in os.environ.items()
+           if k not in (usage_sidecar.SIDECAR_DIR_ENV, usage_sidecar.LEGACY_DIR_ENV, usage_sidecar.ROOT_ENV)}
     env["HOME"] = str(home)
     env.update(extra_env or {})
     return subprocess.run(
@@ -54,7 +55,7 @@ class TestWrites:
     def test_writes_the_record_and_prints_a_line(self, tmp_path):
         result = run(json.dumps(payload()), tmp_path)
         assert result.returncode == 0, result.stderr
-        assert result.stdout.strip() == "$12.35 · 5h 23% · 7d 61% · context 42% · fable-5-1"
+        assert result.stdout.strip() == "gt · $12.35 · 5h 23% · 7d 61% · ctx 42% · fable-5-1"
         record = json.loads(
             (tmp_path / ".claude" / "usage-sidecar" / f"{SID}.json").read_text()
         )
@@ -171,7 +172,7 @@ class TestNeverFails:
 
 class TestConfigurable:
     def test_default_line(self):
-        assert usage_sidecar.status_line(usage_sidecar.record_from(payload()), color=False) == "$12.35 · 5h 23% · 7d 61% · context 42% · fable-5-1"
+        assert usage_sidecar.status_line(usage_sidecar.record_from(payload()), color=False) == "gt · $12.35 · 5h 23% · 7d 61% · ctx 42% · fable-5-1"
 
     def test_segments_in_the_order_given_with_a_separator(self):
         rec = usage_sidecar.record_from(payload())
@@ -235,9 +236,9 @@ class TestColourByPace:
 
     def test_context_colours_by_its_own_thresholds(self):
         rec = usage_sidecar.record_from(payload(context_window={"used_percentage": 72}))
-        assert usage_sidecar.status_line(rec, ["context"]) == f"{self.Y}context 72%{self.X}"
+        assert usage_sidecar.status_line(rec, ["context"]) == f"{self.Y}ctx 72%{self.X}"
         rec = usage_sidecar.record_from(payload(context_window={"used_percentage": 90}))
-        assert usage_sidecar.status_line(rec, ["ctx"]) == f"{self.R}context 90%{self.X}"  # alias
+        assert usage_sidecar.status_line(rec, ["ctx"]) == f"{self.R}ctx 90%{self.X}"  # alias
 
     def test_no_resets_at_means_no_pace_judgement(self):
         rec = usage_sidecar.record_from(payload(rate_limits={"seven_day": {"used_percentage": 60}}))
@@ -251,3 +252,56 @@ class TestColourByPace:
         r = subprocess.run([sys.executable, "-m", "gas_gauge", "--no-file"], input=json.dumps(payload()), env=env,
                            capture_output=True, text=True, timeout=30, check=False)
         assert "\033[" not in r.stdout
+
+
+class TestWhere:
+    def test_under_the_root_names_the_first_folder(self, tmp_path):
+        folder = tmp_path / "webshop" / "src" / "app"
+        folder.mkdir(parents=True)
+        assert usage_sidecar.where(str(folder), str(tmp_path)) == "webshop"
+
+    def test_a_worktree_under_the_root_adds_its_name(self, tmp_path):
+        wt = tmp_path / "webshop" / ".worktrees" / "fix-login" / "src"
+        wt.mkdir(parents=True)
+        assert usage_sidecar.where(str(wt), str(tmp_path)) == "webshop/fix-login"
+
+    def test_the_root_itself_is_its_own_name(self, tmp_path):
+        assert usage_sidecar.where(str(tmp_path), str(tmp_path)) == tmp_path.name
+
+    def test_outside_the_root_names_the_git_repo(self, tmp_path):
+        repo = tmp_path / "elsewhere" / "myrepo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / "src" / "pkg").mkdir(parents=True)
+        root = tmp_path / "gt"
+        root.mkdir()
+        assert usage_sidecar.where(str(repo / "src" / "pkg"), str(root)) == "myrepo"
+        assert usage_sidecar.where(str(repo / "src" / "pkg")) == "myrepo"
+
+    def test_no_repo_falls_back_to_the_folder(self, tmp_path):
+        plain = tmp_path / "notes"
+        plain.mkdir()
+        assert usage_sidecar.where(str(plain)) == "notes"
+
+    def test_no_cwd_draws_nothing(self):
+        assert usage_sidecar.where(None) is None
+        assert usage_sidecar.where("") is None
+
+    def test_root_flag_and_env_reach_the_line(self, tmp_path):
+        folder = tmp_path / "blog" / "src"
+        folder.mkdir(parents=True)
+        data = json.dumps(payload(workspace={"current_dir": str(folder)}))
+        env = {k: v for k, v in os.environ.items() if k not in (usage_sidecar.SIDECAR_DIR_ENV, usage_sidecar.LEGACY_DIR_ENV, usage_sidecar.ROOT_ENV)}
+        cmd = [sys.executable, "-m", "gas_gauge", "--no-file", "--no-color", "--segments", "where,cost"]
+        r = subprocess.run(cmd + ["--root", str(tmp_path)], input=data, env=env, capture_output=True, text=True, timeout=30, check=False)
+        assert r.stdout.strip() == "blog · $12.35"
+        r = subprocess.run(cmd, input=data, env={**env, usage_sidecar.ROOT_ENV: str(tmp_path)}, capture_output=True, text=True, timeout=30, check=False)
+        assert r.stdout.strip() == "blog · $12.35"
+
+
+def test_where_sees_through_a_symlinked_root(tmp_path):
+    real = tmp_path / "data" / "code"
+    (real / "webshop" / "src").mkdir(parents=True)
+    link = tmp_path / "code"
+    link.symlink_to(real)
+    assert usage_sidecar.where(str(real / "webshop" / "src"), str(link)) == "webshop"
+    assert usage_sidecar.where(str(link / "webshop" / "src"), str(real)) == "webshop"
