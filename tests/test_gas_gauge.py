@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -305,3 +306,154 @@ def test_where_sees_through_a_symlinked_root(tmp_path):
     link.symlink_to(real)
     assert usage_sidecar.where(str(real / "webshop" / "src"), str(link)) == "webshop"
     assert usage_sidecar.where(str(link / "webshop" / "src"), str(real)) == "webshop"
+
+
+ENDPOINT_BODY = {
+    "five_hour": {"utilization": 3.0, "resets_at": "2026-10-17T03:00:00.129588+00:00"},
+    "limits": [
+        {"kind": "session", "group": "session", "percent": 3, "resets_at": "2026-10-17T03:00:00+00:00", "scope": None},
+        {"kind": "weekly_all", "group": "weekly", "percent": 89, "resets_at": "2026-10-21T14:00:00+00:00", "scope": None},
+        {"kind": "weekly_scoped", "group": "weekly", "percent": 83, "resets_at": "2026-10-21T14:00:00.129732+00:00",
+         "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None}},
+        {"kind": "weekly_scoped", "group": "weekly", "percent": 5, "resets_at": None,
+         "scope": {"model": None, "surface": {"display_name": "Cowork"}}},
+    ],
+    "weekly_scoped_shares": [{"limit_index": 2, "used_percent_of_weekly": 42, "allowance_percent_of_weekly": 50}],
+}
+FABLE_RESET = 1792591200.129732  # 2026-10-21T14:00:00.129732Z
+
+
+class FakeResponse:
+    def __init__(self, body):
+        self.body = json.dumps(body).encode()
+
+    def read(self, *a):
+        return self.body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def creds(home, expires_ms, token="tok-123"):
+    d = home / ".claude"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {"accessToken": token, "expiresAt": expires_ms}}))
+
+
+class TestModelWeek:
+    """The answering model's own weekly window, read from the usage endpoint (--usage-api)."""
+
+    def test_the_endpoint_body_becomes_the_model_windows(self):
+        scoped = usage_sidecar.scoped_windows(ENDPOINT_BODY)
+        assert scoped == {"fable": {"used_percentage": 83, "resets_at": pytest.approx(FABLE_RESET),
+                                    "share_of_weekly": 42, "allowance_of_weekly": 50}}
+
+    @pytest.mark.parametrize("body", [None, [], {}, {"limits": "x"}, {"limits": [None, 3, {"kind": "weekly_scoped"}]}])
+    def test_a_strange_body_is_no_windows(self, body):
+        assert usage_sidecar.scoped_windows(body) == {}
+
+    def test_shows_for_the_model_that_has_one(self):
+        rec = usage_sidecar.record_from(payload())
+        rec["model_scoped"] = usage_sidecar.scoped_windows(ENDPOINT_BODY)
+        now = FABLE_RESET - 5 * 86400  # two days into the week, 83% gone: ahead of pace
+        assert usage_sidecar.status_line(rec, ["model"], now=now, color=False) == "fable-5-1 83%"
+        assert usage_sidecar.status_line(rec, ["model"], now=now) == f"fable-5-1 {usage_sidecar.YELLOW}83%{usage_sidecar.RESET}"
+
+    def test_nothing_for_a_model_without_one(self):
+        rec = usage_sidecar.record_from(payload(model={"id": "claude-opus-5-5"}))
+        rec["model_scoped"] = usage_sidecar.scoped_windows(ENDPOINT_BODY)
+        assert usage_sidecar.status_line(rec, ["7d", "model"], color=False) == "7d 61% · opus-5-5"
+
+    def test_in_the_default_line_by_the_model_name_once(self):
+        rec = usage_sidecar.record_from(payload())
+        rec["model_scoped"] = {"fable": {"used_percentage": 30, "resets_at": None}}
+        assert usage_sidecar.status_line(rec, color=False) == "gt · $12.35 · 5h 23% · 7d 61% · ctx 42% · fable-5-1 30%"
+
+    def test_the_token_is_used_only_while_valid(self, tmp_path):
+        now = 1_800_000_000.0
+        assert usage_sidecar.login_token(env={}, home=tmp_path, now=now) is None
+        creds(tmp_path, (now + 3600) * 1000)
+        assert usage_sidecar.login_token(env={}, home=tmp_path, now=now) == "tok-123"
+        creds(tmp_path, (now + 30) * 1000)  # expires inside the margin: leave it to Claude Code
+        assert usage_sidecar.login_token(env={}, home=tmp_path, now=now) is None
+        moved = tmp_path / "cfg"
+        moved.mkdir()
+        (moved / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {"accessToken": "m", "expiresAt": (now + 3600) * 1000}}))
+        assert usage_sidecar.login_token(env={"CLAUDE_CONFIG_DIR": str(moved)}, home=tmp_path, now=now) == "m"
+
+    def test_a_fetch_writes_the_reading_with_the_token(self, tmp_path):
+        seen = {}
+
+        def opener(request, timeout):
+            seen["auth"], seen["url"], seen["timeout"] = request.get_header("Authorization"), request.full_url, timeout
+            return FakeResponse(ENDPOINT_BODY)
+
+        usage_sidecar.fetch_usage(tmp_path, now=100.0, token="tok-123", opener=opener)
+        assert seen == {"auth": "Bearer tok-123", "url": usage_sidecar.USAGE_URL, "timeout": usage_sidecar.USAGE_TIMEOUT}
+        usage = usage_sidecar.read_usage(tmp_path)
+        assert usage["fetched_at"] == 100.0 and usage["ok_at"] == 100.0
+        assert usage["model_scoped"]["fable"]["used_percentage"] == 83
+
+    def test_a_failed_fetch_keeps_the_last_good_reading_until_it_goes_stale(self, tmp_path):
+        usage_sidecar.fetch_usage(tmp_path, now=100.0, token="t", opener=lambda r, timeout: FakeResponse(ENDPOINT_BODY))
+
+        def broken(request, timeout):
+            raise OSError("down")
+
+        usage_sidecar.fetch_usage(tmp_path, now=500.0, token="t", opener=broken)
+        usage = usage_sidecar.read_usage(tmp_path)
+        assert usage["error"] == "OSError" and usage["fetched_at"] == 500.0 and usage["ok_at"] == 100.0
+        assert usage_sidecar.fresh_scoped(usage, 600.0)["fable"]["used_percentage"] == 83
+        assert usage_sidecar.fresh_scoped(usage, 100.0 + usage_sidecar.USAGE_STALE + 1) is None
+        usage_sidecar.fetch_usage(tmp_path, now=700.0, token=None, opener=broken)  # no token: no request
+        assert usage_sidecar.read_usage(tmp_path)["error"] == "no valid login token"
+
+    def test_one_background_fetch_per_interval_whoever_draws(self, tmp_path):
+        spawned = []
+        refresh = lambda now: usage_sidecar.refresh_usage_in_background(tmp_path, now, spawn=spawned.append)
+        now = time.time()
+        assert refresh(now) is True                          # nothing on file
+        assert refresh(now) is False                         # a fetch holds the lock
+        (tmp_path / usage_sidecar.USAGE_LOCK).unlink()       # the child finished...
+        usage_sidecar.fetch_usage(tmp_path, now=now, token=None)
+        assert refresh(now + 10) is False                    # ...and its reading is fresh
+        assert refresh(now + usage_sidecar.USAGE_TTL + 1) is True
+        assert len(spawned) == 2
+
+    def test_a_dead_fetch_does_not_hold_the_lock_forever(self, tmp_path):
+        lock = tmp_path / usage_sidecar.USAGE_LOCK
+        lock.touch()
+        old = time.time() - usage_sidecar.LOCK_STALE - 5
+        os.utime(lock, (old, old))
+        assert usage_sidecar.refresh_usage_in_background(tmp_path, spawn=lambda root: None) is True
+
+    def test_the_flag_draws_the_segment_and_keeps_it_in_the_file(self, tmp_path):
+        root = tmp_path / ".claude" / "usage-sidecar"
+        root.mkdir(parents=True)
+        now = time.time()
+        (root / usage_sidecar.USAGE_FILE).write_text(json.dumps(
+            {"fetched_at": now, "ok_at": now, "model_scoped": {"fable": {"used_percentage": 83, "resets_at": None}}}))
+        env = {k: v for k, v in os.environ.items() if k not in (usage_sidecar.SIDECAR_DIR_ENV, usage_sidecar.LEGACY_DIR_ENV)}
+        env["HOME"] = str(tmp_path)
+        cmd = [sys.executable, "-m", "gas_gauge", "--no-color", "--segments", "7d,model"]
+        r = subprocess.run(cmd + ["--usage-api"], input=json.dumps(payload()), env=env, capture_output=True, text=True, timeout=30, check=False)
+        assert r.returncode == 0 and r.stdout.strip() == "7d 61% · fable-5-1 83%"
+        assert json.loads((root / f"{SID}.json").read_text())["model_scoped"]["fable"]["used_percentage"] == 83
+        assert not (root / usage_sidecar.USAGE_LOCK).exists()  # fresh: no fetch started
+        r = subprocess.run(cmd, input=json.dumps(payload()), env=env, capture_output=True, text=True, timeout=30, check=False)
+        assert r.stdout.strip() == "7d 61% · fable-5-1"         # without the flag, nothing is read
+
+    def test_the_child_without_a_login_writes_an_error_and_frees_the_lock(self, tmp_path):
+        env = {k: v for k, v in os.environ.items() if k not in (usage_sidecar.SIDECAR_DIR_ENV, usage_sidecar.LEGACY_DIR_ENV, "CLAUDE_CONFIG_DIR")}
+        env["HOME"] = str(tmp_path)
+        root = tmp_path / "g"
+        root.mkdir()
+        (root / usage_sidecar.USAGE_LOCK).touch()
+        r = subprocess.run([sys.executable, "-m", "gas_gauge", "--usage-api-fetch", "--dir", str(root)],
+                           input="", env=env, capture_output=True, text=True, timeout=30, check=False)
+        assert r.returncode == 0
+        assert usage_sidecar.read_usage(root)["error"] == "no valid login token"
+        assert not (root / usage_sidecar.USAGE_LOCK).exists()

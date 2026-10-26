@@ -15,7 +15,11 @@ Bad or missing input prints nothing and exits 0.
 
 Known limits, both shared with /usage itself: the total resets on /clear (a new session id, so
 a new file) and restarts from zero when a session is resumed (same id; the file keeps the
-earlier peak as peak_total_cost_usd). The per-model weekly window is not in the payload.
+earlier peak as peak_total_cost_usd).
+
+The per-model weekly window (Fable's, say) is not in the payload. With --usage-api the gauge
+reads it from the endpoint /usage itself reads, in a detached child at most every five minutes,
+so drawing the line never waits on the network (see refresh_usage_in_background).
 """
 
 
@@ -24,9 +28,12 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 SIDECAR_DIR_ENV = "GAS_GAUGE_DIR"
@@ -97,6 +104,22 @@ def record_from(data):
     }
 
 
+def _write_json(target, obj):
+    """Atomic: a reader never sees a half-written file."""
+    fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh)
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return target
+
+
 def write_record(record, root):
     """Atomic: a reader never sees a half-written file.
 
@@ -113,18 +136,157 @@ def write_record(record, root):
         record["total_cost_usd"] = previous_total
     candidates = [c for c in (record["total_cost_usd"], previous_total, previous_peak) if c is not None]
     record["peak_total_cost_usd"] = max(candidates) if candidates else None
-    fd, tmp = tempfile.mkstemp(dir=str(root), prefix=".tmp-", suffix=".json")
+    return _write_json(target, record)
+
+
+# The per-model weekly windows. Claude Code reads them from this endpoint with its own login
+# and leaves them out of the status-line payload (2.1.302: `limits[]` rows of kind
+# `weekly_scoped`, labelled e.g. "Fable"). The endpoint is undocumented; a change to it shows
+# as the segment disappearing, never as a broken line. The login token is used only while it
+# is valid and is never refreshed: a refresh rotates the token Claude Code itself holds.
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+USAGE_FILE = ".usage.json"     # a dotfile, so it is never mistaken for a <session_id>.json
+USAGE_LOCK = ".usage.lock"
+USAGE_TTL = 300                # seconds between fetches, across every session sharing the folder
+USAGE_STALE = 1800             # a reading older than this is not shown
+USAGE_TIMEOUT = 5
+LOCK_STALE = 60                # a fetch that has held the lock this long has died
+
+
+def _get(obj, *keys):
+    for key in keys:
+        if not isinstance(obj, dict):
+            return None
+        obj = obj.get(key)
+    return obj
+
+
+def _epoch(value):
+    """Epoch seconds from a number or an ISO 8601 string, or None."""
+    if _number(value) is not None:
+        return value
+    if not isinstance(value, str):
+        return None
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(record, fh)
-        os.replace(tmp, target)
-    except BaseException:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def scoped_windows(body):
+    """{model label: {used_percentage, resets_at, share_of_weekly, allowance_of_weekly}} from
+    the endpoint's weekly_scoped rows. The label is the first word of the server's, lower-cased
+    ("Fable" -> "fable"), which is how it is matched against the model id."""
+    out = {}
+    limits = _get(body, "limits")
+    if not isinstance(limits, list):
+        return out
+    shares = {s.get("limit_index"): s for s in (_get(body, "weekly_scoped_shares") or [])
+              if isinstance(s, dict)}
+    for i, row in enumerate(limits):
+        if _get(row, "kind") != "weekly_scoped":
+            continue
+        name = _get(row, "scope", "model", "display_name")
+        if not isinstance(name, str) or not name.split():
+            continue
+        share = shares.get(i) or {}
+        out[name.split()[0].lower()] = {
+            "used_percentage": _number(row.get("percent")),
+            "resets_at": _epoch(row.get("resets_at")),
+            "share_of_weekly": _number(share.get("used_percent_of_weekly")),
+            "allowance_of_weekly": _number(share.get("allowance_percent_of_weekly")),
+        }
+    return out
+
+
+def login_token(env=None, home=None, now=None):
+    """Claude Code's OAuth access token, or None if it is missing or about to expire."""
+    env = os.environ if env is None else env
+    config = Path(env["CLAUDE_CONFIG_DIR"]).expanduser() if env.get("CLAUDE_CONFIG_DIR") else \
+        (Path.home() if home is None else Path(home)) / ".claude"
+    try:
+        data = json.loads((config / ".credentials.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    token, expires = _get(data, "claudeAiOauth", "accessToken"), _number(_get(data, "claudeAiOauth", "expiresAt"))
+    now = time.time() if now is None else now
+    if not isinstance(token, str) or not token or expires is None or expires / 1000 <= now + 60:
+        return None
+    return token
+
+
+def read_usage(root):
+    try:
+        with open(root / USAGE_FILE, encoding="utf-8") as fh:
+            usage = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return usage if isinstance(usage, dict) else None
+
+
+def fetch_usage(root, now=None, token=None, opener=None):
+    """One fetch, written to <root>/.usage.json. A failure is written too (as `error`, with the
+    last good reading kept), so the next fetch waits USAGE_TTL like any other."""
+    now = time.time() if now is None else now
+    previous = read_usage(root) or {}
+    result = {"fetched_at": now}
+    if token is None:
+        result["error"] = "no valid login token"
+    else:
+        request = urllib.request.Request(USAGE_URL, headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "claude-gas-gauge",
+        })
         try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-    return target
+            with (opener or urllib.request.urlopen)(request, timeout=USAGE_TIMEOUT) as response:
+                result["model_scoped"] = scoped_windows(json.load(response))
+            result["ok_at"] = now
+        except Exception as e:  # noqa: BLE001 - recorded, never raised
+            result["error"] = type(e).__name__
+    if "ok_at" not in result and _number(previous.get("ok_at")) is not None:
+        result["model_scoped"], result["ok_at"] = previous.get("model_scoped"), previous["ok_at"]
+    root.mkdir(parents=True, exist_ok=True)
+    _write_json(root / USAGE_FILE, result)
+    return result
+
+
+def _spawn_fetch(root):
+    subprocess.Popen([sys.executable, "-m", "gas_gauge", "--usage-api-fetch", "--dir", str(root)],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True, close_fds=True)
+
+
+def refresh_usage_in_background(root, now=None, spawn=None):
+    """Start a detached fetch when the reading is older than USAGE_TTL and no fetch holds the
+    lock. Returns whether it started one. Every session draws the line; one fetch serves all."""
+    now = time.time() if now is None else now
+    fetched = _number((read_usage(root) or {}).get("fetched_at"))
+    if fetched is not None and now - fetched < USAGE_TTL:
+        return False
+    root.mkdir(parents=True, exist_ok=True)
+    lock = root / USAGE_LOCK
+    try:
+        if now - lock.stat().st_mtime < LOCK_STALE:
+            return False
+        lock.unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    except FileExistsError:
+        return False
+    (spawn or _spawn_fetch)(root)
+    return True
+
+
+def fresh_scoped(usage, now):
+    """The reading's model_scoped, if it is recent enough to show."""
+    ok_at = _number((usage or {}).get("ok_at"))
+    scoped = (usage or {}).get("model_scoped")
+    if ok_at is None or now - ok_at > USAGE_STALE or not isinstance(scoped, dict):
+        return None
+    return scoped
 
 
 # The segments a line can show, in the order you list them. Each is a function of the record
@@ -229,8 +391,24 @@ def where(cwd, root=None):
     return path.name or str(path)
 
 
-def _seg_model(r):
-    return str(r["model"]).replace("claude-", "") if r.get("model") else None
+def _seg_model(r, now=None, color=True):
+    """The model, and its own weekly window when it has one (with --usage-api): `fable-5-1 83%`.
+    The window is coloured by pace like the others; the name is not."""
+    model = r.get("model")
+    if not model:
+        return None
+    name = str(model).replace("claude-", "")
+    scoped = r.get("model_scoped")
+    if not isinstance(scoped, dict):
+        return name
+    for label, win in scoped.items():
+        if isinstance(win, dict) and label in str(model).lower():
+            pct = _number(win.get("used_percentage"))
+            if pct is None:
+                break
+            state = window_state(pct, _number(win.get("resets_at")), WINDOW_SECONDS["seven_day"], now)
+            return f"{name} {paint(f'{pct:.0f}%', state, color)}"
+    return name
 
 
 def _compact(n):
@@ -268,7 +446,7 @@ DEFAULT_SEGMENTS = ("where", "cost", "5h", "7d", "context", "model")
 DEFAULT_SEPARATOR = " · "
 
 
-COLOURED = {"5h", "7d", "context", "ctx"}
+COLOURED = {"5h", "7d", "context", "ctx", "model"}
 
 
 def status_line(record, segments=DEFAULT_SEGMENTS, separator=DEFAULT_SEPARATOR, color=True, now=None, root=None):
@@ -305,6 +483,9 @@ def parse_args(argv=None):
                     help=f"a folder of projects; `where` names the project under it (default: ${ROOT_ENV})")
     ap.add_argument("--no-file", action="store_true", help="print the line only; write nothing")
     ap.add_argument("--no-color", action="store_true", help="plain text (also: NO_COLOR in the environment)")
+    ap.add_argument("--usage-api", action="store_true",
+                    help="add the model's own weekly window to the model segment, read from the usage endpoint with your Claude Code login")
+    ap.add_argument("--usage-api-fetch", action="store_true", help=argparse.SUPPRESS)  # the detached child
     return ap.parse_args(argv)
 
 
@@ -313,6 +494,18 @@ def main(argv=None):
         args = parse_args(argv)
     except SystemExit as e:  # --help, or a bad flag: say so and still exit 0 (never break the prompt)
         return 0 if e.code in (0, None) else 0
+    root_dir = Path(args.dir).expanduser() if args.dir else sidecar_root()
+    if args.usage_api_fetch:
+        try:
+            fetch_usage(root_dir, token=login_token())
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            try:
+                (root_dir / USAGE_LOCK).unlink()
+            except OSError:
+                pass
+        return 0
     try:
         data = json.loads(sys.stdin.read() or "null")
         if not isinstance(data, dict):
@@ -320,13 +513,22 @@ def main(argv=None):
         record = record_from(data)
         if record is None:
             return 0
+        now = time.time()
+        if args.usage_api:
+            try:
+                scoped = fresh_scoped(read_usage(root_dir), now)
+                if scoped is not None:
+                    record["model_scoped"] = scoped
+                refresh_usage_in_background(root_dir, now)
+            except Exception:  # noqa: BLE001 - the rest of the line still draws
+                pass
         if not args.no_file:
-            write_record(record, Path(args.dir).expanduser() if args.dir else sidecar_root())
+            write_record(record, root_dir)
         segments = [p.strip() for p in args.segments.split(",") if p.strip()] if args.segments else DEFAULT_SEGMENTS
         color = not args.no_color and not os.environ.get("NO_COLOR")
         root = args.root or os.environ.get(ROOT_ENV) or None
         line = status_line(record, segments, args.separator if args.separator is not None else DEFAULT_SEPARATOR,
-                           color=color, root=root)
+                           color=color, now=now, root=root)
         if line:
             print(line)
     except Exception:  # noqa: BLE001 - a status line must never fail

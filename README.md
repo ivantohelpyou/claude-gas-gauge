@@ -11,9 +11,9 @@ windows is used, how full the context window is, and which model is answering. T
 go to a small JSON file per session, so your own tooling can read what a session cost without
 anyone pasting `/usage` into anything.
 
-No dependencies, no daemon, no network. A hundred and fifty lines of Python that read the JSON
-Claude Code pipes to its status line and never fail: bad or missing input prints nothing and
-exits 0.
+No dependencies, no daemon, and no network unless you ask for it (`--usage-api`, below). A few
+hundred lines of Python that read the JSON Claude Code pipes to its status line and never fail:
+bad or missing input prints nothing and exits 0.
 
 ## Install
 
@@ -43,11 +43,37 @@ at https://code.claude.com/docs/en/statusline.
 | `5h 17%` | the plan's five-hour rolling window, used | past 80% with hours to the reset: finish the turn, start nothing wide |
 | `7d 4%` | the plan's seven-day window, used; the binding constraint on a flat plan | pace it: a day is 14% of a week |
 | `ctx 42%` | how full the context window is; every later turn re-reads all of it | past 70%, a checkpoint and `/clear` is cheaper than ten more turns |
-| `fable-5-1` | the model answering | is it the one you meant? |
+| `fable-5-1 83%` | the model answering, and its own weekly allocation used, when it has one (the % needs `--usage-api`) | is it the one you meant? The model can run out before the week does; switch before it does |
 
 The two windows appear only for claude.ai subscription accounts, and only after the first API
-response. The per-model weekly window that `/usage` draws is not in the payload Claude Code
-provides, so it is not on the line.
+response.
+
+## The model's own week (`--usage-api`)
+
+Some models carry a weekly allocation of their own on top of the plan's (`/usage` shows it as,
+say, "Fable limit"). Claude Code leaves it out of the status-line payload, so the gauge can only
+get it by asking the endpoint `/usage` reads. That is opt-in:
+
+```json
+{ "statusLine": { "type": "command", "command": "gas-gauge --usage-api" } }
+```
+
+What it does, so you can decide:
+
+- It reads Claude Code's login token from `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR`)
+  and sends it to `https://api.anthropic.com/api/oauth/usage`, nowhere else. It uses the token
+  only while it is valid and never refreshes it: a refresh would rotate the token Claude Code
+  holds. On macOS, where the token is in the Keychain, it finds none and the segment stays off.
+- The fetch runs in a detached child at most once every five minutes, shared by every session
+  using the same folder (`.usage.json` and a `.usage.lock` next to the session files). Drawing
+  the line only reads the file, so it never waits on the network.
+- The endpoint is undocumented. If it changes, the segment disappears; the line does not break.
+  A reading older than 30 minutes is not shown.
+
+The percentage goes on the `model` segment, after the name: `fable-5-1 83%` in a Fable session,
+plain `opus-5-5` in an Opus one. It is coloured by pace like the windows.
+The session file gets the same numbers under `model_scoped`, with the model's share of the whole
+week and its allowance (`share_of_weekly`, `allowance_of_weekly`).
 
 ## Configure
 
@@ -64,7 +90,7 @@ The line is yours. Pick the segments and their order, and the separator, in the 
 | `5h` | `5h 17%` |
 | `7d` | `7d 4%` |
 | `context` | `ctx 42%` (`ctx` is accepted as a name too) |
-| `model` | `fable-5-1` |
+| `model` | `fable-5-1`, or `fable-5-1 83%` with `--usage-api` |
 | `tokens` | `305k in / 4k out` |
 | `session` | the first eight characters of the session id |
 | `version` | `cc 2.1.299` |
@@ -83,7 +109,7 @@ the prompt.
 
 ## Colour
 
-The two windows are coloured by pace. A window being spent faster than time passes is dull
+The windows are coloured by pace. A window being spent faster than time passes is dull
 yellow: on day one of the week, `7d 18%` is yellow, because a seventh of the week has gone and
 more than a seventh of it is spent. A window at 90% or more is red. The `ctx` segment is
 yellow from 70% and red from 85%. `--no-color` or `NO_COLOR` in the environment turns it off.
