@@ -520,7 +520,7 @@ class TestPlan:
             run(week_payload(pct, t0 + i * WEEK), tmp_path)
         assert run(week_payload(1, t0 + 3 * WEEK), tmp_path, {"NO_COLOR": "1"}).stdout.strip().endswith("· Ultra")
 
-    def test_a_week_that_ended_nearly_empty_says_the_plan_ran_short(self, tmp_path):
+    def test_a_week_that_ended_at_93_percent_says_the_plan_ran_short(self, tmp_path):
         with_plan(tmp_path)
         t0 = 1760400000
         run(week_payload(40, t0), tmp_path)
@@ -551,6 +551,49 @@ class TestPlan:
         weeks = {"current": {"resets_at": 100 * WEEK, "peak": 10}, "closed": []}
         after, _ = usage_sidecar.update_weeks(weeks, {"used_percentage": 20, "resets_at": 100 * WEEK + 1})
         assert after["closed"] == [] and after["current"]["peak"] == 20
+
+    def test_the_same_week_tolerance_ends_at_an_hour(self):
+        weeks = {"current": {"resets_at": 100 * WEEK, "peak": 10}, "closed": []}
+        same, _ = usage_sidecar.update_weeks(weeks, {"used_percentage": 20, "resets_at": 100 * WEEK + 3599})
+        assert same["closed"] == []
+        rolled, _ = usage_sidecar.update_weeks(weeks, {"used_percentage": 20, "resets_at": 100 * WEEK + 3600})
+        assert [w["peak"] for w in rolled["closed"]] == [10]
+
+    def test_an_old_heavy_week_no_longer_counts(self, tmp_path):
+        with_plan(tmp_path)
+        t0 = 1760400000
+        run(week_payload(95, t0), tmp_path)
+        out = run(week_payload(5, t0 + 10 * WEEK), tmp_path, {"NO_COLOR": "1"}).stdout.strip()
+        assert out.endswith("· Ultra")
+
+    def test_light_weeks_spread_over_months_are_not_four_recent_weeks(self, tmp_path):
+        with_plan(tmp_path)
+        t0 = 1760400000
+        for i in range(5):
+            run(week_payload(10, t0 + i * 8 * WEEK), tmp_path)    # a week used every two months
+        out = run(week_payload(1, t0 + 41 * WEEK), tmp_path, {"NO_COLOR": "1"}).stdout.strip()
+        assert out.endswith("· Ultra")
+
+    def test_a_failed_history_write_still_shows_the_verdict(self, tmp_path, monkeypatch, capsys):
+        with_plan(tmp_path)
+        folder = tmp_path / "g"
+        folder.mkdir()
+        t0 = 1760400000
+        (folder / usage_sidecar.WEEKS_FILE).write_text(json.dumps(
+            {"current": {"resets_at": t0, "peak": 95}, "closed": []}))
+        real = usage_sidecar._write_json
+
+        def failing(target, obj):
+            if target.name == usage_sidecar.WEEKS_FILE:
+                raise OSError("disk full")
+            return real(target, obj)
+
+        monkeypatch.setattr(usage_sidecar, "_write_json", failing)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(sys, "stdin", __import__("io").StringIO(week_payload(5, t0 + WEEK)))
+        assert usage_sidecar.main(["--dir", str(folder), "--no-color"]) == 0
+        assert capsys.readouterr().out.strip().endswith("Ultra \u2191")
 
     def test_only_the_last_twelve_weeks_are_kept(self):
         weeks = {"current": None, "closed": []}

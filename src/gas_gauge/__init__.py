@@ -360,10 +360,22 @@ def update_weeks(weeks, seven_day):
     return {"current": {"resets_at": resets, "peak": pct}, "closed": closed[-WEEKS_KEPT:]}, True
 
 
+def recent_weeks(closed, current_reset):
+    """The closed weeks among the last PLAN_WEEKS calendar weeks before the window that resets at
+    `current_reset`. Weeks nobody used were never recorded, so this can hold fewer than PLAN_WEEKS;
+    an old heavy week does not keep the verdict red, and light weeks spread over a year do not add
+    up to four."""
+    if current_reset is None:
+        return []
+    oldest = current_reset - PLAN_WEEKS * WINDOW_SECONDS["seven_day"] - 3600
+    return [w["peak"] for w in closed if oldest <= w["resets_at"] < current_reset - 3600]
+
+
 def plan_fit(record):
-    """'tight', 'roomy', or None (fits, or too few closed weeks to say)."""
-    spend = _number(((record.get("rate_limits") or {}).get("spend_limit") or {}).get("used_percentage"))
-    recent = [w["peak"] for w in (record.get("plan_weeks") or [])][-PLAN_WEEKS:]
+    """'tight', 'roomy', or None (fits, or too few recent weeks to say)."""
+    limits = record.get("rate_limits") or {}
+    spend = _number((limits.get("spend_limit") or {}).get("used_percentage"))
+    recent = recent_weeks(record.get("plan_weeks") or [], _number((limits.get("seven_day") or {}).get("resets_at")))
     if (spend is not None and spend > 0) or any(p >= PLAN_TIGHT_AT for p in recent):
         return "tight"
     if len(recent) >= PLAN_WEEKS and all(p < PLAN_ROOMY_UNDER for p in recent):
@@ -621,14 +633,20 @@ def main(argv=None):
         segments = [p.strip() for p in args.segments.split(",") if p.strip()] if args.segments else DEFAULT_SEGMENTS
         weeks = None
         if "plan" in segments:
+            # .weeks.json is read, changed and written without a lock: two sessions drawing in the
+            # same few milliseconds can lose one reading. Peaks only ratchet up and the next reading
+            # repairs the week, so a lock (and the waits it brings to a status line) is not worth it.
             try:
                 record["plan"] = plan_name()
                 weeks, changed = update_weeks(read_weeks(root_dir), (record.get("rate_limits") or {}).get("seven_day"))
-                if changed and not args.no_file:
+            except Exception:  # noqa: BLE001 - the rest of the line still draws
+                weeks, changed = None, False
+            if changed and not args.no_file:
+                try:
                     root_dir.mkdir(parents=True, exist_ok=True)
                     _write_json(root_dir / WEEKS_FILE, weeks)
-            except Exception:  # noqa: BLE001 - the rest of the line still draws
-                weeks = None
+                except Exception:  # noqa: BLE001 - an unwritable folder still shows the verdict
+                    pass
         if not args.no_file:
             write_record(record, root_dir)
         if weeks is not None:

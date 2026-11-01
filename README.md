@@ -62,7 +62,9 @@ The `plan` segment names your plan and, once a few weeks have closed, says wheth
 
 It judges from your own weeks only, not from a table of plans and prices. The gauge keeps the
 highest seven-day figure it saw in each window, in `.weeks.json` next to the session files (twelve
-weeks, a few hundred bytes), and the verdict reads the last four. The 25% line is there because plan
+weeks, a few hundred bytes), and the verdict reads the last four calendar weeks. A week you
+didn't use isn't recorded, so `↓` needs all four on file, and a heavy week more than four weeks
+back no longer counts. The 25% line is there because plan
 tiers usually step by about four. Whether a smaller tier exists for you, and what it costs, is
 between you and the pricing page. History starts the first time the segment is drawn, so `↓` can
 appear no sooner than four weeks after that.
