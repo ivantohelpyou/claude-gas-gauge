@@ -38,7 +38,8 @@ def payload(**over):
 
 def run(stdin, home, extra_env=None):
     env = {k: v for k, v in os.environ.items()
-           if k not in (usage_sidecar.SIDECAR_DIR_ENV, usage_sidecar.LEGACY_DIR_ENV, usage_sidecar.ROOT_ENV)}
+           if k not in (usage_sidecar.SIDECAR_DIR_ENV, usage_sidecar.LEGACY_DIR_ENV, usage_sidecar.ROOT_ENV,
+                         "CLAUDE_CONFIG_DIR")}
     env["HOME"] = str(home)
     env.update(extra_env or {})
     return subprocess.run(
@@ -457,3 +458,119 @@ class TestModelWeek:
         assert r.returncode == 0
         assert usage_sidecar.read_usage(root)["error"] == "no valid login token"
         assert not (root / usage_sidecar.USAGE_LOCK).exists()
+
+
+# -- the plan, and whether it fits ------------------------------------------
+
+WEEK = 7 * 86400
+
+
+def with_plan(home, name="Ultra"):
+    (home / ".claude.json").write_text(json.dumps({"oauthAccount": {"planDisplayName": name}}))
+
+
+def week_payload(pct, resets_at, **limits):
+    rl = {"seven_day": {"used_percentage": pct, "resets_at": resets_at}}
+    rl.update(limits)
+    return json.dumps(payload(rate_limits=rl))
+
+
+class TestPlan:
+    def test_the_plan_name_ends_the_default_line(self, tmp_path):
+        with_plan(tmp_path)
+        result = run(json.dumps(payload()), tmp_path, {"NO_COLOR": "1"})
+        assert result.stdout.strip() == "gt · $12.35 · 5h 23% · 7d 61% · ctx 42% · fable-5-1 · Ultra"
+
+    def test_no_config_means_no_segment(self, tmp_path):
+        result = run(json.dumps(payload()), tmp_path, {"NO_COLOR": "1"})
+        assert not result.stdout.strip().endswith("Ultra")
+        assert result.stdout.strip().endswith("fable-5-1")
+
+    def test_config_dir_override_is_read(self, tmp_path):
+        moved = tmp_path / "cfg"
+        moved.mkdir()
+        with_plan(moved, "Pro")
+        result = run(json.dumps(payload()), tmp_path, {"NO_COLOR": "1", "CLAUDE_CONFIG_DIR": str(moved)})
+        assert result.stdout.strip().endswith("· Pro")
+
+    def test_a_malformed_config_still_draws_the_line(self, tmp_path):
+        (tmp_path / ".claude.json").write_text("{not json")
+        result = run(json.dumps(payload()), tmp_path, {"NO_COLOR": "1"})
+        assert result.returncode == 0
+        assert result.stdout.strip().endswith("fable-5-1")
+
+    def test_the_session_file_names_the_plan_but_not_the_weeks(self, tmp_path):
+        with_plan(tmp_path)
+        run(json.dumps(payload()), tmp_path)
+        record = json.loads((tmp_path / ".claude" / "usage-sidecar" / f"{SID}.json").read_text())
+        assert record["plan"] == "Ultra"
+        assert "plan_weeks" not in record
+
+    def test_four_short_weeks_say_a_smaller_plan_would_do(self, tmp_path):
+        with_plan(tmp_path)
+        t0 = 1760400000
+        for i, pct in enumerate([10, 20, 15, 24]):
+            run(week_payload(pct, t0 + i * WEEK), tmp_path)
+        assert run(week_payload(1, t0 + 4 * WEEK), tmp_path, {"NO_COLOR": "1"}).stdout.strip().endswith("Ultra \u2193")
+
+    def test_three_closed_weeks_are_too_few_to_say(self, tmp_path):
+        with_plan(tmp_path)
+        t0 = 1760400000
+        for i, pct in enumerate([10, 20, 15]):
+            run(week_payload(pct, t0 + i * WEEK), tmp_path)
+        assert run(week_payload(1, t0 + 3 * WEEK), tmp_path, {"NO_COLOR": "1"}).stdout.strip().endswith("· Ultra")
+
+    def test_a_week_that_ended_nearly_empty_says_the_plan_ran_short(self, tmp_path):
+        with_plan(tmp_path)
+        t0 = 1760400000
+        run(week_payload(40, t0), tmp_path)
+        run(week_payload(93, t0), tmp_path)           # the same week, later and fuller
+        out = run(week_payload(5, t0 + WEEK), tmp_path).stdout.strip()
+        assert out.endswith(usage_sidecar.RED + "Ultra \u2191" + usage_sidecar.RESET)
+
+    def test_extra_usage_says_the_plan_ran_short_at_once(self, tmp_path):
+        with_plan(tmp_path)
+        out = run(week_payload(50, 1760400000, spend_limit={"used_percentage": 3, "resets_at": 1760400000}),
+                  tmp_path, {"NO_COLOR": "1"}).stdout.strip()
+        assert out.endswith("Ultra \u2191")
+
+    def test_a_week_closes_at_its_peak_not_its_last_reading(self, tmp_path):
+        root = usage_sidecar.read_weeks(tmp_path)
+        for pct in (30, 80, 50):                    # a stale session reports a lower figure later
+            root, _ = usage_sidecar.update_weeks(root, {"used_percentage": pct, "resets_at": 100 * WEEK})
+        root, _ = usage_sidecar.update_weeks(root, {"used_percentage": 2, "resets_at": 101 * WEEK})
+        assert [w["peak"] for w in root["closed"]] == [80]
+        assert root["current"]["peak"] == 2
+
+    def test_an_older_reset_from_a_stale_session_changes_nothing(self):
+        weeks = {"current": {"resets_at": 101 * WEEK, "peak": 10}, "closed": []}
+        after, changed = usage_sidecar.update_weeks(weeks, {"used_percentage": 99, "resets_at": 100 * WEEK})
+        assert not changed and after == weeks
+
+    def test_a_reset_that_wobbles_by_seconds_is_the_same_week(self):
+        weeks = {"current": {"resets_at": 100 * WEEK, "peak": 10}, "closed": []}
+        after, _ = usage_sidecar.update_weeks(weeks, {"used_percentage": 20, "resets_at": 100 * WEEK + 1})
+        assert after["closed"] == [] and after["current"]["peak"] == 20
+
+    def test_only_the_last_twelve_weeks_are_kept(self):
+        weeks = {"current": None, "closed": []}
+        for i in range(20):
+            weeks, _ = usage_sidecar.update_weeks(weeks, {"used_percentage": i, "resets_at": (100 + i) * WEEK})
+        assert len(weeks["closed"]) == usage_sidecar.WEEKS_KEPT
+        assert weeks["closed"][-1]["peak"] == 18
+
+    def test_no_file_writes_no_history(self, tmp_path):
+        with_plan(tmp_path)
+        proc = subprocess.run([sys.executable, "-m", "gas_gauge", "--no-file"], input=json.dumps(payload()),
+                              env={**{k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"},
+                                   "HOME": str(tmp_path)}, capture_output=True, text=True, timeout=30)
+        assert proc.returncode == 0
+        assert not (tmp_path / ".claude" / "usage-sidecar" / usage_sidecar.WEEKS_FILE).exists()
+
+    def test_a_line_without_the_plan_segment_keeps_no_history(self, tmp_path):
+        with_plan(tmp_path)
+        proc = subprocess.run([sys.executable, "-m", "gas_gauge", "--segments", "cost"], input=json.dumps(payload()),
+                              env={**{k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"},
+                                   "HOME": str(tmp_path)}, capture_output=True, text=True, timeout=30)
+        assert proc.stdout.strip() == "$12.35"
+        assert not (tmp_path / ".claude" / "usage-sidecar" / usage_sidecar.WEEKS_FILE).exists()

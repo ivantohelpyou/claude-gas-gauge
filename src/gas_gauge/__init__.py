@@ -289,6 +289,101 @@ def fresh_scoped(usage, now):
     return scoped
 
 
+# The plan, and whether it fits. Claude Code does not put the plan in the status-line payload;
+# it keeps it in its own config (~/.claude.json, oauthAccount.planDisplayName, e.g. "Ultra"). The
+# field is undocumented: if it moves, the segment disappears, never the line.
+#
+# Whether the plan fits is read from your own weeks, not from any table of plans: the gauge keeps
+# the highest seven-day figure it saw in each window (<dir>/.weeks.json) and, once a few weeks have
+# closed, says what they show. A week that ended at 90% or more, or any use of extra usage
+# (`spend_limit`), means the plan ran short. Every closed week ending under a quarter means you paid
+# for at least four times what you used: a quarter, because plan tiers usually step by about four.
+WEEKS_FILE = ".weeks.json"
+WEEKS_KEPT = 12        # closed weeks remembered
+PLAN_WEEKS = 4         # closed weeks the verdict reads
+PLAN_TIGHT_AT = 90.0   # a week that ended this full ran short
+PLAN_ROOMY_UNDER = 25.0
+
+
+def plan_name(env=None, home=None):
+    """The plan's display name from Claude Code's config, or None."""
+    env = os.environ if env is None else env
+    if env.get("CLAUDE_CONFIG_DIR"):
+        path = Path(env["CLAUDE_CONFIG_DIR"]).expanduser() / ".claude.json"
+    else:
+        path = (Path.home() if home is None else Path(home)) / ".claude.json"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            name = _get(json.load(fh), "oauthAccount", "planDisplayName")
+    except (OSError, ValueError):
+        return None
+    return name.strip() if isinstance(name, str) and name.strip() else None
+
+
+def read_weeks(root):
+    try:
+        with open(root / WEEKS_FILE, encoding="utf-8") as fh:
+            weeks = json.load(fh)
+    except (OSError, ValueError):
+        return {"current": None, "closed": []}
+    if not isinstance(weeks, dict):
+        return {"current": None, "closed": []}
+    closed = [w for w in weeks.get("closed") or [] if isinstance(w, dict)
+              and _number(w.get("resets_at")) is not None and _number(w.get("peak")) is not None]
+    current = weeks.get("current")
+    if not (isinstance(current, dict) and _number(current.get("resets_at")) is not None
+            and _number(current.get("peak")) is not None):
+        current = None
+    return {"current": current, "closed": closed}
+
+
+def update_weeks(weeks, seven_day):
+    """Fold one reading of the seven-day window into the history. Returns (weeks, changed).
+    A reading with a later reset than the one on file closes that week at its peak; a reading
+    with an earlier reset (a stale session) is ignored."""
+    pct = _number((seven_day or {}).get("used_percentage"))
+    resets = _number((seven_day or {}).get("resets_at"))
+    if pct is None or resets is None:
+        return weeks, False
+    current, closed = weeks["current"], list(weeks["closed"])
+    if current is None:
+        return {"current": {"resets_at": resets, "peak": pct}, "closed": closed}, True
+    # resets_at can wobble by a second between payloads; the same week is within an hour
+    if abs(resets - current["resets_at"]) < 3600:
+        if pct <= current["peak"]:
+            return weeks, False
+        return {"current": {"resets_at": current["resets_at"], "peak": pct}, "closed": closed}, True
+    if resets < current["resets_at"]:
+        return weeks, False
+    closed = [w for w in closed if abs(w["resets_at"] - current["resets_at"]) >= 3600] + [current]
+    closed.sort(key=lambda w: w["resets_at"])
+    return {"current": {"resets_at": resets, "peak": pct}, "closed": closed[-WEEKS_KEPT:]}, True
+
+
+def plan_fit(record):
+    """'tight', 'roomy', or None (fits, or too few closed weeks to say)."""
+    spend = _number(((record.get("rate_limits") or {}).get("spend_limit") or {}).get("used_percentage"))
+    recent = [w["peak"] for w in (record.get("plan_weeks") or [])][-PLAN_WEEKS:]
+    if (spend is not None and spend > 0) or any(p >= PLAN_TIGHT_AT for p in recent):
+        return "tight"
+    if len(recent) >= PLAN_WEEKS and all(p < PLAN_ROOMY_UNDER for p in recent):
+        return "roomy"
+    return None
+
+
+def _seg_plan(r, now=None, color=True):
+    """`Ultra`, `Ultra ↑` when it ran short (red), `Ultra ↓` when a smaller one would do (yellow)."""
+    name = r.get("plan")
+    if not name:
+        return None
+    fit = plan_fit(r)
+    if fit == "tight":
+        return paint(f"{name} \u2191", "red", color)
+    if fit == "roomy":
+        return paint(f"{name} \u2193", "yellow", color)
+    return name
+
+
 # The segments a line can show, in the order you list them. Each is a function of the record
 # that returns a string or None (nothing to show, so the segment is skipped, not left blank).
 def _seg_cost(r):
@@ -441,12 +536,13 @@ SEGMENTS = {
     "tokens": _seg_tokens,
     "session": _seg_session,
     "version": _seg_version,
+    "plan": _seg_plan,
 }
-DEFAULT_SEGMENTS = ("where", "cost", "5h", "7d", "context", "model")
+DEFAULT_SEGMENTS = ("where", "cost", "5h", "7d", "context", "model", "plan")
 DEFAULT_SEPARATOR = " · "
 
 
-COLOURED = {"5h", "7d", "context", "ctx", "model"}
+COLOURED = {"5h", "7d", "context", "ctx", "model", "plan"}
 
 
 def status_line(record, segments=DEFAULT_SEGMENTS, separator=DEFAULT_SEPARATOR, color=True, now=None, root=None):
@@ -522,9 +618,21 @@ def main(argv=None):
                 refresh_usage_in_background(root_dir, now)
             except Exception:  # noqa: BLE001 - the rest of the line still draws
                 pass
+        segments = [p.strip() for p in args.segments.split(",") if p.strip()] if args.segments else DEFAULT_SEGMENTS
+        weeks = None
+        if "plan" in segments:
+            try:
+                record["plan"] = plan_name()
+                weeks, changed = update_weeks(read_weeks(root_dir), (record.get("rate_limits") or {}).get("seven_day"))
+                if changed and not args.no_file:
+                    root_dir.mkdir(parents=True, exist_ok=True)
+                    _write_json(root_dir / WEEKS_FILE, weeks)
+            except Exception:  # noqa: BLE001 - the rest of the line still draws
+                weeks = None
         if not args.no_file:
             write_record(record, root_dir)
-        segments = [p.strip() for p in args.segments.split(",") if p.strip()] if args.segments else DEFAULT_SEGMENTS
+        if weeks is not None:
+            record["plan_weeks"] = weeks["closed"]  # for the line only; the session file does not carry it
         color = not args.no_color and not os.environ.get("NO_COLOR")
         root = args.root or os.environ.get(ROOT_ENV) or None
         line = status_line(record, segments, args.separator if args.separator is not None else DEFAULT_SEPARATOR,

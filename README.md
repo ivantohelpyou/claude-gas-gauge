@@ -43,10 +43,34 @@ at https://code.claude.com/docs/en/statusline.
 | `5h 17%` | the plan's five-hour rolling window, used | past 80% with hours to the reset: finish the turn, start nothing wide |
 | `7d 4%` | the plan's seven-day window, used; the binding constraint on a flat plan | pace it: a day is 14% of a week |
 | `ctx 42%` | how full the context window is; every later turn re-reads all of it | past 70%, a checkpoint and `/clear` is cheaper than ten more turns |
+| `Ultra` | your plan, with `↑` (red) when it ran short and `↓` (yellow) when a smaller one would do | see "Am I on the right plan?" below |
 | `fable-5-1 83%` | the model answering, and its own weekly allocation used, when it has one (the % needs `--usage-api`) | is it the one you meant? The model can run out before the week does; switch before it does |
 
 The two windows appear only for claude.ai subscription accounts, and only after the first API
-response.
+response. A plan without a five-hour window (some higher tiers have none) simply has no `5h`
+segment.
+
+## Am I on the right plan?
+
+The `plan` segment names your plan and, once a few weeks have closed, says whether it fits:
+
+| Shows | Means |
+|---|---|
+| `Ultra` | fits, or fewer than four closed weeks to judge by |
+| `Ultra ↑` (red) | it ran short: one of the last four weeks ended at 90% or more, or you are using extra usage now |
+| `Ultra ↓` (yellow) | each of the last four weeks ended under 25%: you paid for at least four times what you used |
+
+It judges from your own weeks only, not from a table of plans and prices. The gauge keeps the
+highest seven-day figure it saw in each window, in `.weeks.json` next to the session files (twelve
+weeks, a few hundred bytes), and the verdict reads the last four. The 25% line is there because plan
+tiers usually step by about four. Whether a smaller tier exists for you, and what it costs, is
+between you and the pricing page. History starts the first time the segment is drawn, so `↓` can
+appear no sooner than four weeks after that.
+
+The plan name comes from Claude Code's own config, `~/.claude.json` (or `$CLAUDE_CONFIG_DIR`),
+field `oauthAccount.planDisplayName`. The status-line payload doesn't carry it, and the field is
+undocumented: if it moves, the segment disappears and the line doesn't break. Nothing is sent
+anywhere. API-key accounts have no plan and no seven-day window, so the segment stays off.
 
 ## The model's own week (`--usage-api`)
 
@@ -94,8 +118,9 @@ The line is yours. Pick the segments and their order, and the separator, in the 
 | `tokens` | `305k in / 4k out` |
 | `session` | the first eight characters of the session id |
 | `version` | `cc 2.1.299` |
+| `plan` | `Ultra`, `Ultra ↑`, `Ultra ↓` |
 
-Default: `where,cost,5h,7d,context,model`. A segment with nothing to show is skipped, not left blank; a
+Default: `where,cost,5h,7d,context,model,plan`. A segment with nothing to show is skipped, not left blank; a
 name this version does not know is ignored.
 
 `where` names the git repository the session's folder is in, or the folder itself outside one.
