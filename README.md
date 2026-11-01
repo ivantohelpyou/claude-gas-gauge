@@ -43,7 +43,7 @@ at https://code.claude.com/docs/en/statusline.
 | `5h 17%` | the plan's five-hour rolling window, used | past 80% with hours to the reset: finish the turn, start nothing wide |
 | `7d 4%` | the plan's seven-day window, used; the binding constraint on a flat plan | pace it: a day is 14% of a week |
 | `ctx 42%` | how full the context window is; every later turn re-reads all of it | past 70%, a checkpoint and `/clear` is cheaper than ten more turns |
-| `Ultra` | your plan, with `↑` (red) when it ran short and `↓` (yellow) when a smaller one would do | see "Am I on the right plan?" below |
+| `Ultra` | your plan; `💡 Max −$100/mo` when another plan fits your weeks better | see "Am I on the right plan?" below |
 | `fable-5-1 83%` | the model answering, and its own weekly allocation used, when it has one (the % needs `--usage-api`) | is it the one you meant? The model can run out before the week does; switch before it does |
 
 The two windows appear only for claude.ai subscription accounts, and only after the first API
@@ -52,27 +52,49 @@ segment.
 
 ## Am I on the right plan?
 
-The `plan` segment names your plan and, once a few weeks have closed, says whether it fits:
+The `plan` segment names your plan. When your own recent weeks say another plan would suit you
+better, a light bulb appears with the plan and the monthly difference:
 
 | Shows | Means |
 |---|---|
-| `Ultra` | fits, or fewer than four closed weeks to judge by |
-| `Ultra ↑` (red) | it ran short: one of the last four weeks ended at 90% or more, or you are using extra usage now |
-| `Ultra ↓` (yellow) | each of the last four weeks ended under 25%: you paid for at least four times what you used |
+| `Ultra` | nothing to suggest |
+| `Ultra 💡 Max −$100/mo` (yellow) | each of your last four weeks would have fit on Max, the cheapest plan that holds them |
+| `Max 💡 Ultra +$100/mo` (red) | a recent week ran out (90% or more), or you are using extra usage now; Ultra would have held it |
+| `Ultra ↑` (red) | it ran short and no listed plan would have held it: a warning, not a suggestion |
 
-It judges from your own weeks only, not from a table of plans and prices. The gauge keeps the
-highest seven-day figure it saw in each window, in `.weeks.json` next to the session files (twelve
-weeks, a few hundred bytes), and the verdict reads the last four calendar weeks. A week you
-didn't use isn't recorded, so `↓` needs all four on file, and a heavy week more than four weeks
-back no longer counts. The 25% line is there because plan
-tiers usually step by about four. Whether a smaller tier exists for you, and what it costs, is
-between you and the pricing page. History starts the first time the segment is drawn, so `↓` can
-appear no sooner than four weeks after that.
+**How it works.** The gauge keeps the highest seven-day figure it saw in each window, and the plan
+it was on, in `.weeks.json` next to the session files (twelve weeks, a few hundred bytes). A week's
+figure is a share of that plan's week, so on another plan the same use is that share times the
+ratio of the two plans' weekly capacity: 44% of Ultra is 88% of Max, which holds; 46% is 92%, which
+doesn't. A plan "holds" a week if it would have stayed under 90%. A suggestion to go down needs all
+four of the last four calendar weeks on file; a week you didn't use isn't recorded. If you switch
+plans, the weeks you spent on the old one are rescaled, not mixed in as if nothing changed.
+
+**The plan table.** Prices and weekly capacity (as a multiple of Pro's) are built in from
+[claude.com/pricing](https://claude.com/pricing), read 2026-10-31:
+
+| Plan | $/month | Weekly usage |
+|---|---|---|
+| Pro | 20 | 1x |
+| Max | 100 | 5x |
+| Ultra | 200 | 10x (no five-hour limit) |
+
+Plans change. Two safeguards:
+
+- **The built-in table expires.** 120 days after its date the gauge stops making suggestions (it
+  still warns when you run short), because a stale price is worse than none. A new release with a
+  re-read table turns them back on. The test suite has a deliberately dated test that fails on the
+  same day and says what to re-read, so the table can't go stale without the build noticing.
+- **You can supply your own:** `--plans "Pro:20:1,Max:100:5,Ultra:200:10"` (name, dollars a month,
+  weekly multiple). A table you pass yourself never expires. A malformed one is ignored and the
+  built-in table is used.
+
+A plan the table doesn't know (Team, Enterprise, an API key) gets no suggestion, only the warning.
 
 The plan name comes from Claude Code's own config, `~/.claude.json` (or `$CLAUDE_CONFIG_DIR`),
 field `oauthAccount.planDisplayName`. The status-line payload doesn't carry it, and the field is
 undocumented: if it moves, the segment disappears and the line doesn't break. Nothing is sent
-anywhere. API-key accounts have no plan and no seven-day window, so the segment stays off.
+anywhere.
 
 ## The model's own week (`--usage-api`)
 
@@ -120,7 +142,7 @@ The line is yours. Pick the segments and their order, and the separator, in the 
 | `tokens` | `305k in / 4k out` |
 | `session` | the first eight characters of the session id |
 | `version` | `cc 2.1.299` |
-| `plan` | `Ultra`, `Ultra ↑`, `Ultra ↓` |
+| `plan` | `Ultra`, `Ultra 💡 Max −$100/mo`, `Ultra ↑` |
 
 Default: `where,cost,5h,7d,context,model,plan`. A segment with nothing to show is skipped, not left blank; a
 name this version does not know is ignored.

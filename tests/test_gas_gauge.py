@@ -463,6 +463,7 @@ class TestModelWeek:
 # -- the plan, and whether it fits ------------------------------------------
 
 WEEK = 7 * 86400
+TABLE = "Pro:20:1,Max:100:5,Ultra:200:10"   # pinned, so these tests never depend on the date
 
 
 def with_plan(home, name="Ultra"):
@@ -506,12 +507,104 @@ class TestPlan:
         assert record["plan"] == "Ultra"
         assert "plan_weeks" not in record
 
-    def test_four_short_weeks_say_a_smaller_plan_would_do(self, tmp_path):
-        with_plan(tmp_path)
+    def weeks_then_line(self, home, peaks, plan="Ultra", extra=None):
+        with_plan(home, plan)
         t0 = 1760400000
-        for i, pct in enumerate([10, 20, 15, 24]):
-            run(week_payload(pct, t0 + i * WEEK), tmp_path)
-        assert run(week_payload(1, t0 + 4 * WEEK), tmp_path, {"NO_COLOR": "1"}).stdout.strip().endswith("Ultra \u2193")
+        for i, pct in enumerate(peaks):
+            run(week_payload(pct, t0 + i * WEEK), home)
+        args = extra if extra is not None else ["--plans", TABLE]
+        proc = subprocess.run([sys.executable, "-m", "gas_gauge", "--no-color", *args],
+                              input=week_payload(1, t0 + len(peaks) * WEEK),
+                              env={**{k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"},
+                                   "HOME": str(home)}, capture_output=True, text=True, timeout=30)
+        return proc.stdout.strip()
+
+    def test_ultra_weeks_that_max_would_have_held_suggest_max(self, tmp_path):
+        # Max has half Ultra's week: 44% of Ultra is 88% of Max, under 90
+        assert self.weeks_then_line(tmp_path, [30, 40, 20, 44]).endswith("Ultra \U0001F4A1 Max \u2212$100/mo")
+
+    def test_one_week_max_could_not_have_held_keeps_ultra(self, tmp_path):
+        # 46% of Ultra is 92% of Max
+        assert self.weeks_then_line(tmp_path, [30, 40, 20, 46]).endswith("\u00b7 Ultra")
+
+    def test_a_max_week_that_ran_short_suggests_ultra(self, tmp_path):
+        # 95% of Max is 47.5% of Ultra
+        assert self.weeks_then_line(tmp_path, [95], plan="Max").endswith("Max \U0001F4A1 Ultra +$100/mo")
+
+    def test_light_max_weeks_suggest_the_cheapest_plan_that_holds(self, tmp_path):
+        # Pro has a fifth of Max's week: 17% of Max is 85% of Pro
+        assert self.weeks_then_line(tmp_path, [10, 17, 5, 12], plan="Max").endswith("Max \U0001F4A1 Pro \u2212$80/mo")
+
+    def test_plans_flag_replaces_the_table(self, tmp_path):
+        out = self.weeks_then_line(tmp_path, [30, 40, 20, 44], extra=["--plans", "Max:150:5,Ultra:200:10"])
+        assert out.endswith("Ultra \U0001F4A1 Max \u2212$50/mo")
+
+    def test_a_malformed_plans_flag_still_draws_the_plan(self, tmp_path):
+        out = self.weeks_then_line(tmp_path, [30, 40, 20, 44], extra=["--plans", "Max:lots"])
+        assert "Ultra" in out and out.startswith("gt ")
+
+    def test_parse_plans_rejects_bad_entries(self):
+        assert usage_sidecar.parse_plans("Max:lots") is None
+        assert usage_sidecar.parse_plans("Max:100:0") is None
+        assert usage_sidecar.parse_plans("Max:-1:5") is None
+        assert usage_sidecar.parse_plans("Max:nan:5") is None
+        assert usage_sidecar.parse_plans("Max:100:5,Ultra:200:10") == {"max": (100.0, 5.0), "ultra": (200.0, 10.0)}
+
+    def test_weeks_on_max_are_rescaled_after_moving_to_ultra(self, tmp_path):
+        # four weeks at 80% of Max are 40% of Ultra: after the move, Max would still have held them
+        home = tmp_path
+        t0 = 1760400000
+        with_plan(home, "Max")
+        for i in range(4):
+            run(week_payload(80, t0 + i * WEEK), home)
+        with_plan(home, "Ultra")
+        proc = subprocess.run([sys.executable, "-m", "gas_gauge", "--no-color", "--plans", TABLE],
+                              input=week_payload(1, t0 + 4 * WEEK),
+                              env={**{k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"},
+                                   "HOME": str(home)}, capture_output=True, text=True, timeout=30)
+        assert proc.stdout.strip().endswith("Ultra \U0001F4A1 Max \u2212$100/mo")
+
+    def test_without_rescaling_those_weeks_would_read_as_too_full(self):
+        # the same four weeks, recorded with no plan, read as 80% of Ultra: no suggestion
+        closed = [{"resets_at": (100 + i) * WEEK, "peak": 80} for i in range(4)]
+        record = {"plan": "Ultra", "plan_weeks": closed,
+                  "rate_limits": {"seven_day": {"used_percentage": 1, "resets_at": 104 * WEEK}}}
+        assert usage_sidecar.plan_fit(record, usage_sidecar.parse_plans(TABLE)) is None
+        tagged = [dict(w, plan="Max") for w in closed]
+        assert usage_sidecar.plan_fit(dict(record, plan_weeks=tagged), usage_sidecar.parse_plans(TABLE)) == ("down", "max", 100.0)
+
+    def test_a_stale_table_makes_no_suggestion_but_still_warns(self):
+        closed = [{"resets_at": (100 + i) * WEEK, "peak": 30} for i in range(4)]
+        record = {"plan": "Ultra", "plan_weeks": closed,
+                  "rate_limits": {"seven_day": {"used_percentage": 1, "resets_at": 104 * WEEK}}}
+        assert usage_sidecar.plan_fit(record, suggest=False) is None
+        full = dict(record, plan_weeks=closed[:3] + [{"resets_at": 103 * WEEK, "peak": 95}])
+        assert usage_sidecar.plan_fit(full, suggest=False) == ("up", None, None)
+
+    def test_plans_fresh_turns_off_after_the_stale_age(self):
+        as_of = usage_sidecar.datetime.fromisoformat(usage_sidecar.PLANS_AS_OF + "T00:00:00+00:00").timestamp()
+        assert usage_sidecar.plans_fresh(as_of + 86400)
+        assert not usage_sidecar.plans_fresh(as_of + (usage_sidecar.PLANS_STALE_DAYS + 1) * 86400)
+
+    def test_the_built_in_plan_table_is_fresh(self):
+        """Deliberately dated. When this fails, plans may have changed: re-read
+        https://claude.com/pricing, update DEFAULT_PLANS and PLANS_AS_OF in src/gas_gauge/__init__.py,
+        and cut a release. Until then the gauge makes no plan suggestions (it still warns)."""
+        assert usage_sidecar.plans_fresh(time.time()), (
+            f"plan table dated {usage_sidecar.PLANS_AS_OF} is over {usage_sidecar.PLANS_STALE_DAYS} days old: "
+            "re-read https://claude.com/pricing and update DEFAULT_PLANS / PLANS_AS_OF")
+
+    def test_a_plan_not_in_the_table_only_warns(self, tmp_path):
+        assert self.weeks_then_line(tmp_path, [95], plan="Team").endswith("Team \u2191")
+        quiet = tmp_path / "quiet"
+        quiet.mkdir()
+        assert self.weeks_then_line(quiet, [5, 5, 5, 5], plan="Team").endswith("\u00b7 Team")
+
+    def test_the_session_file_carries_no_plan_table(self, tmp_path):
+        with_plan(tmp_path)
+        run(json.dumps(payload()), tmp_path)
+        record = json.loads((tmp_path / ".claude" / "usage-sidecar" / f"{SID}.json").read_text())
+        assert "plans" not in record
 
     def test_three_closed_weeks_are_too_few_to_say(self, tmp_path):
         with_plan(tmp_path)

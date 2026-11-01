@@ -1,6 +1,6 @@
 [project]
 name = "claude-gas-gauge"
-version = "0.4.0"
+version = "0.5.0"
 description = "A Claude Code status line that shows what the session costs and writes it to disk for your own tooling"
 readme = "README.md"
 requires-python = ">=3.10"

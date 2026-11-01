@@ -293,16 +293,45 @@ def fresh_scoped(usage, now):
 # it keeps it in its own config (~/.claude.json, oauthAccount.planDisplayName, e.g. "Ultra"). The
 # field is undocumented: if it moves, the segment disappears, never the line.
 #
-# Whether the plan fits is read from your own weeks, not from any table of plans: the gauge keeps
-# the highest seven-day figure it saw in each window (<dir>/.weeks.json) and, once a few weeks have
-# closed, says what they show. A week that ended at 90% or more, or any use of extra usage
-# (`spend_limit`), means the plan ran short. Every closed week ending under a quarter means you paid
-# for at least four times what you used: a quarter, because plan tiers usually step by about four.
+# Whether the plan fits is read from your own weeks against the other plans: the gauge keeps the
+# highest seven-day figure it saw in each window (<dir>/.weeks.json). Those figures are a share of
+# YOUR plan's week; on another plan the same use is that share times (your capacity / its capacity).
+# A plan "would have held" a week if that figure stays under PLAN_HOLDS_UNDER. The verdict names the
+# cheapest plan that would have held every recent week, if that is not yours.
 WEEKS_FILE = ".weeks.json"
 WEEKS_KEPT = 12        # closed weeks remembered
 PLAN_WEEKS = 4         # closed weeks the verdict reads
-PLAN_TIGHT_AT = 90.0   # a week that ended this full ran short
-PLAN_ROOMY_UNDER = 25.0
+PLAN_HOLDS_UNDER = 90.0  # a week that would end this full or fuller did not fit
+
+# The individual plans: name -> (dollars a month, weekly usage as a multiple of Pro's).
+# From https://claude.com/pricing, read 2026-10-31. Prices and multiples change: --plans overrides,
+# e.g. --plans "Pro:20:1,Max:100:5,Ultra:200:10". A plan not in the table gets no comparison.
+PLANS_AS_OF = "2026-10-31"
+PLANS_STALE_DAYS = 120   # past this, the built-in table makes no suggestions: a stale price misleads
+DEFAULT_PLANS = {"pro": (20.0, 1.0), "max": (100.0, 5.0), "ultra": (200.0, 10.0)}
+
+
+def plans_fresh(now):
+    """Whether the built-in table is young enough to suggest from."""
+    as_of = datetime.fromisoformat(PLANS_AS_OF + "T00:00:00+00:00").timestamp()
+    return now - as_of < PLANS_STALE_DAYS * 86400
+
+
+def parse_plans(text):
+    """'Name:price:multiple,...' -> {name lower: (price, multiple)}; None if any entry is malformed."""
+    plans = {}
+    for item in (text or "").split(","):
+        bits = [b.strip() for b in item.split(":")]
+        if len(bits) != 3 or not bits[0]:
+            return None
+        try:
+            price, mult = float(bits[1]), float(bits[2])
+        except ValueError:
+            return None
+        if not (math.isfinite(price) and math.isfinite(mult)) or price < 0 or mult <= 0:
+            return None
+        plans[bits[0].lower()] = (price, mult)
+    return plans or None
 
 
 def plan_name(env=None, home=None):
@@ -337,7 +366,7 @@ def read_weeks(root):
     return {"current": current, "closed": closed}
 
 
-def update_weeks(weeks, seven_day):
+def update_weeks(weeks, seven_day, plan=None):
     """Fold one reading of the seven-day window into the history. Returns (weeks, changed).
     A reading with a later reset than the one on file closes that week at its peak; a reading
     with an earlier reset (a stale session) is ignored."""
@@ -346,18 +375,22 @@ def update_weeks(weeks, seven_day):
     if pct is None or resets is None:
         return weeks, False
     current, closed = weeks["current"], list(weeks["closed"])
+    def week(at, peak):
+        return {"resets_at": at, "peak": peak, "plan": plan} if plan else {"resets_at": at, "peak": peak}
     if current is None:
-        return {"current": {"resets_at": resets, "peak": pct}, "closed": closed}, True
+        return {"current": week(resets, pct), "closed": closed}, True
     # resets_at can wobble by a second between payloads; the same week is within an hour
     if abs(resets - current["resets_at"]) < 3600:
-        if pct <= current["peak"]:
+        if pct <= current["peak"] and (not plan or current.get("plan") == plan):
             return weeks, False
-        return {"current": {"resets_at": current["resets_at"], "peak": pct}, "closed": closed}, True
+        # a plan change mid-week: the window now measures the new plan, so the week is the new plan's
+        peak = pct if plan and current.get("plan") not in (None, plan) else max(pct, current["peak"])
+        return {"current": week(current["resets_at"], peak), "closed": closed}, True
     if resets < current["resets_at"]:
         return weeks, False
     closed = [w for w in closed if abs(w["resets_at"] - current["resets_at"]) >= 3600] + [current]
     closed.sort(key=lambda w: w["resets_at"])
-    return {"current": {"resets_at": resets, "peak": pct}, "closed": closed[-WEEKS_KEPT:]}, True
+    return {"current": week(resets, pct), "closed": closed[-WEEKS_KEPT:]}, True
 
 
 def recent_weeks(closed, current_reset):
@@ -368,32 +401,66 @@ def recent_weeks(closed, current_reset):
     if current_reset is None:
         return []
     oldest = current_reset - PLAN_WEEKS * WINDOW_SECONDS["seven_day"] - 3600
-    return [w["peak"] for w in closed if oldest <= w["resets_at"] < current_reset - 3600]
+    return [w for w in closed if oldest <= w["resets_at"] < current_reset - 3600]
 
 
-def plan_fit(record):
-    """'tight', 'roomy', or None (fits, or too few recent weeks to say)."""
+def plan_fit(record, plans=None, suggest=True):
+    """What your recent weeks say about your plan: None (keep it, or too little to say), or
+    (direction, other plan's name, monthly difference in dollars), direction 'up' or 'down'.
+
+    'up': you ran short (a recent week at PLAN_HOLDS_UNDER or more on your plan, or extra usage in
+    use); names the cheapest dearer plan that would have held every recent week, or None if none
+    would. 'down': all PLAN_WEEKS recent weeks are on file and a cheaper plan would have held
+    every one; names the cheapest such."""
+    plans = DEFAULT_PLANS if plans is None else plans
+    key = lambda name: str(name or "").split(" ")[0].lower()
+    mine = plans.get(key(record.get("plan")))
     limits = record.get("rate_limits") or {}
     spend = _number((limits.get("spend_limit") or {}).get("used_percentage"))
-    recent = recent_weeks(record.get("plan_weeks") or [], _number((limits.get("seven_day") or {}).get("resets_at")))
-    if (spend is not None and spend > 0) or any(p >= PLAN_TIGHT_AT for p in recent):
-        return "tight"
-    if len(recent) >= PLAN_WEEKS and all(p < PLAN_ROOMY_UNDER for p in recent):
-        return "roomy"
+    recent = []
+    for w in recent_weeks(record.get("plan_weeks") or [], _number((limits.get("seven_day") or {}).get("resets_at"))):
+        then = plans.get(key(w.get("plan"))) if w.get("plan") else mine
+        if w.get("plan") and key(w.get("plan")) != key(record.get("plan")):
+            if then is None or mine is None:
+                continue  # a week on a plan the table can't convert says nothing about this one
+            recent.append(w["peak"] * then[1] / mine[1])
+        else:
+            recent.append(w["peak"])
+    short = (spend is not None and spend > 0) or any(p >= PLAN_HOLDS_UNDER for p in recent)
+    if mine is None or not suggest:
+        return ("up", None, None) if short else None
+    price, mult = mine
+    worst = max(recent, default=0.0)
+    if short:
+        worst = max(worst, PLAN_HOLDS_UNDER)  # extra usage: at least full
+    holds = sorted((p, name) for name, (p, m) in plans.items()
+                   if worst * mult / m < PLAN_HOLDS_UNDER)
+    if short:
+        dearer = [(p, n) for p, n in holds if p > price]
+        return ("up", dearer[0][1], dearer[0][0] - price) if dearer else ("up", None, None)
+    if len(recent) >= PLAN_WEEKS:
+        cheaper = [(p, n) for p, n in holds if p < price]
+        if cheaper:
+            return ("down", cheaper[0][1], price - cheaper[0][0])
     return None
 
 
 def _seg_plan(r, now=None, color=True):
-    """`Ultra`, `Ultra ↑` when it ran short (red), `Ultra ↓` when a smaller one would do (yellow)."""
+    """`Ultra`, plain, when there is nothing to suggest. A light bulb when there is: `Ultra 💡 Max
+    −$100/mo` (yellow) when a cheaper plan would have held every recent week, `Max 💡 Ultra +$100/mo`
+    (red) when yours ran short and a dearer one would have held. `Ultra ↑` (red) when it ran short
+    and no listed plan would have held: a warning, not a suggestion."""
     name = r.get("plan")
     if not name:
         return None
-    fit = plan_fit(r)
-    if fit == "tight":
-        return paint(f"{name} \u2191", "red", color)
-    if fit == "roomy":
-        return paint(f"{name} \u2193", "yellow", color)
-    return name
+    fit = plan_fit(r, r.get("plans"), r.get("plans_suggest", True))
+    if fit is None:
+        return name
+    direction, other, diff = fit
+    state, sign = ("red", "+") if direction == "up" else ("yellow", "\u2212")
+    if other is None:
+        return paint(f"{name} \u2191", state, color)
+    return paint(f"{name} \U0001F4A1 {other.title() if other.islower() else other} {sign}${diff:,.0f}/mo", state, color)
 
 
 # The segments a line can show, in the order you list them. Each is a function of the record
@@ -593,6 +660,8 @@ def parse_args(argv=None):
     ap.add_argument("--no-color", action="store_true", help="plain text (also: NO_COLOR in the environment)")
     ap.add_argument("--usage-api", action="store_true",
                     help="add the model's own weekly window to the model segment, read from the usage endpoint with your Claude Code login")
+    ap.add_argument("--plans", default=None,
+                    help=f"the plans to compare yours with, 'Name:dollars-a-month:weekly-multiple,...' (default: claude.com/pricing as of {PLANS_AS_OF})")
     ap.add_argument("--usage-api-fetch", action="store_true", help=argparse.SUPPRESS)  # the detached child
     return ap.parse_args(argv)
 
@@ -638,7 +707,8 @@ def main(argv=None):
             # repairs the week, so a lock (and the waits it brings to a status line) is not worth it.
             try:
                 record["plan"] = plan_name()
-                weeks, changed = update_weeks(read_weeks(root_dir), (record.get("rate_limits") or {}).get("seven_day"))
+                weeks, changed = update_weeks(read_weeks(root_dir), (record.get("rate_limits") or {}).get("seven_day"),
+                                              record.get("plan"))
             except Exception:  # noqa: BLE001 - the rest of the line still draws
                 weeks, changed = None, False
             if changed and not args.no_file:
@@ -651,6 +721,9 @@ def main(argv=None):
             write_record(record, root_dir)
         if weeks is not None:
             record["plan_weeks"] = weeks["closed"]  # for the line only; the session file does not carry it
+            custom = parse_plans(args.plans) if args.plans else None
+            record["plans"] = custom or DEFAULT_PLANS
+            record["plans_suggest"] = custom is not None or plans_fresh(now)
         color = not args.no_color and not os.environ.get("NO_COLOR")
         root = args.root or os.environ.get(ROOT_ENV) or None
         line = status_line(record, segments, args.separator if args.separator is not None else DEFAULT_SEPARATOR,
