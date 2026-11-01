@@ -583,6 +583,11 @@ class TestPlan:
         after, _ = usage_sidecar.update_weeks(weeks, {"used_percentage": 45, "resets_at": 100 * WEEK}, None)
         assert after["current"] == {"resets_at": 100 * WEEK, "peak": 45, "plan": "Ultra"}
 
+    def test_the_same_plan_spelled_differently_is_not_a_switch(self):
+        weeks = {"current": {"resets_at": 100 * WEEK, "peak": 60, "plan": "Ultra"}, "closed": []}
+        after, _ = usage_sidecar.update_weeks(weeks, {"used_percentage": 20, "resets_at": 100 * WEEK}, "ULTRA ")
+        assert after["current"]["peak"] == 60
+
     def test_extra_usage_alone_suggests_the_next_plan_up(self):
         record = {"plan": "Max", "plan_weeks": [],
                   "rate_limits": {"seven_day": {"used_percentage": 40, "resets_at": 104 * WEEK},

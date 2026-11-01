@@ -388,10 +388,11 @@ def update_weeks(weeks, seven_day, plan=None):
         return {"current": week(resets, pct), "closed": closed}, True
     # resets_at can wobble by a second between payloads; the same week is within an hour
     if abs(resets - current["resets_at"]) < 3600:
-        if pct <= current["peak"] and (not plan or current.get("plan") == plan):
+        same_plan = not plan or plan_key(current.get("plan")) == plan_key(plan)
+        if pct <= current["peak"] and same_plan:
             return weeks, False
         # a plan change mid-week: the window now measures the new plan, so the week is the new plan's
-        peak = pct if plan and current.get("plan") not in (None, plan) else max(pct, current["peak"])
+        peak = pct if current.get("plan") and not same_plan else max(pct, current["peak"])
         return {"current": week(current["resets_at"], peak, current.get("plan")), "closed": closed}, True
     if resets < current["resets_at"]:
         return weeks, False
@@ -467,7 +468,8 @@ def _seg_plan(r, now=None, color=True):
     state, sign = ("red", "+") if direction == "up" else ("yellow", "\u2212")
     if other is None:
         return paint(f"{name} \u2191", state, color)
-    return paint(f"{name} \U0001F4A1 {" ".join(w.capitalize() if w.isalpha() else w for w in other.split())} {sign}${diff:,.0f}/mo", state, color)
+    label = " ".join(w.capitalize() if w.isalpha() else w for w in other.split())
+    return paint(f"{name} \U0001F4A1 {label} {sign}${diff:,.0f}/mo", state, color)
 
 
 # The segments a line can show, in the order you list them. Each is a function of the record
