@@ -539,9 +539,55 @@ class TestPlan:
         out = self.weeks_then_line(tmp_path, [30, 40, 20, 44], extra=["--plans", "Max:150:5,Ultra:200:10"])
         assert out.endswith("Ultra \U0001F4A1 Max \u2212$50/mo")
 
-    def test_a_malformed_plans_flag_still_draws_the_plan(self, tmp_path):
-        out = self.weeks_then_line(tmp_path, [30, 40, 20, 44], extra=["--plans", "Max:lots"])
-        assert "Ultra" in out and out.startswith("gt ")
+    def test_a_malformed_plans_flag_falls_back_to_the_built_in_table(self, tmp_path, monkeypatch, capsys):
+        with_plan(tmp_path)
+        folder = tmp_path / "g"
+        folder.mkdir()
+        t0 = 1760400000
+        (folder / usage_sidecar.WEEKS_FILE).write_text(json.dumps({"current": None, "closed": [
+            {"resets_at": t0 + i * WEEK, "peak": 40, "plan": "Ultra"} for i in range(4)]}))
+        monkeypatch.setattr(usage_sidecar, "plans_fresh", lambda now: True)   # the date is not under test
+        monkeypatch.setattr(usage_sidecar, "DEFAULT_PLANS", {"max": (150.0, 5.0), "ultra": (200.0, 10.0)})
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(sys, "stdin", __import__("io").StringIO(week_payload(1, t0 + 4 * WEEK)))
+        usage_sidecar.main(["--dir", str(folder), "--no-color", "--plans", "Max:lots"])
+        assert capsys.readouterr().out.strip().endswith("Ultra \U0001F4A1 Max \u2212$50/mo")
+
+    def test_a_spaced_plan_name_matches_its_own_table_entry(self, tmp_path):
+        out = self.weeks_then_line(tmp_path, [95], plan="Max 5x", extra=["--plans", "Max 5x:100:5,Max 20x:200:20"])
+        assert out.endswith("Max 5x \U0001F4A1 Max 20x +$100/mo")
+
+    def test_a_name_the_table_does_not_hold_is_not_read_as_its_first_word(self, tmp_path):
+        # 'Max 20x' is not the table's 5x 'Max': no downgrade suggestion from a wrong capacity
+        assert self.weeks_then_line(tmp_path, [10, 10, 10, 10], plan="Max 20x").endswith("\u00b7 Max 20x")
+
+    def test_a_mid_week_switch_restarts_the_week_on_the_new_plan(self):
+        weeks = {"current": {"resets_at": 100 * WEEK, "peak": 60, "plan": "Max"}, "closed": []}
+        after, _ = usage_sidecar.update_weeks(weeks, {"used_percentage": 31, "resets_at": 100 * WEEK}, "Ultra")
+        assert after["current"] == {"resets_at": 100 * WEEK, "peak": 31, "plan": "Ultra"}
+
+    def test_a_week_from_0_4_0_gets_stamped_and_keeps_its_peak(self):
+        weeks = {"current": {"resets_at": 100 * WEEK, "peak": 60}, "closed": []}
+        after, changed = usage_sidecar.update_weeks(weeks, {"used_percentage": 10, "resets_at": 100 * WEEK}, "Ultra")
+        assert changed and after["current"] == {"resets_at": 100 * WEEK, "peak": 60, "plan": "Ultra"}
+
+    def test_a_closed_week_keeps_the_plan_it_was_on(self):
+        weeks = {"current": {"resets_at": 100 * WEEK, "peak": 60, "plan": "Max"}, "closed": []}
+        after, _ = usage_sidecar.update_weeks(weeks, {"used_percentage": 5, "resets_at": 101 * WEEK}, "Ultra")
+        assert after["closed"] == [{"resets_at": 100 * WEEK, "peak": 60, "plan": "Max"}]
+        assert after["current"]["plan"] == "Ultra"
+
+    def test_an_unreadable_plan_keeps_the_weeks_stamp(self):
+        weeks = {"current": {"resets_at": 100 * WEEK, "peak": 30, "plan": "Ultra"}, "closed": []}
+        after, _ = usage_sidecar.update_weeks(weeks, {"used_percentage": 45, "resets_at": 100 * WEEK}, None)
+        assert after["current"] == {"resets_at": 100 * WEEK, "peak": 45, "plan": "Ultra"}
+
+    def test_extra_usage_alone_suggests_the_next_plan_up(self):
+        record = {"plan": "Max", "plan_weeks": [],
+                  "rate_limits": {"seven_day": {"used_percentage": 40, "resets_at": 104 * WEEK},
+                                  "spend_limit": {"used_percentage": 2, "resets_at": 104 * WEEK}}}
+        assert usage_sidecar.plan_fit(record, usage_sidecar.parse_plans(TABLE)) == ("up", "ultra", 100.0)
 
     def test_parse_plans_rejects_bad_entries(self):
         assert usage_sidecar.parse_plans("Max:lots") is None

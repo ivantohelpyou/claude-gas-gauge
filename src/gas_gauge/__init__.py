@@ -311,6 +311,12 @@ PLANS_STALE_DAYS = 120   # past this, the built-in table makes no suggestions: a
 DEFAULT_PLANS = {"pro": (20.0, 1.0), "max": (100.0, 5.0), "ultra": (200.0, 10.0)}
 
 
+def plan_key(name):
+    """How a plan name is matched against the table: the whole name, lower-cased, spaces collapsed.
+    The whole name, not its first word: 'Max 20x' must not be read as a 5x 'Max'."""
+    return " ".join(str(name or "").split()).lower()
+
+
 def plans_fresh(now):
     """Whether the built-in table is young enough to suggest from."""
     as_of = datetime.fromisoformat(PLANS_AS_OF + "T00:00:00+00:00").timestamp()
@@ -330,7 +336,7 @@ def parse_plans(text):
             return None
         if not (math.isfinite(price) and math.isfinite(mult)) or price < 0 or mult <= 0:
             return None
-        plans[bits[0].lower()] = (price, mult)
+        plans[plan_key(bits[0])] = (price, mult)
     return plans or None
 
 
@@ -375,8 +381,9 @@ def update_weeks(weeks, seven_day, plan=None):
     if pct is None or resets is None:
         return weeks, False
     current, closed = weeks["current"], list(weeks["closed"])
-    def week(at, peak):
-        return {"resets_at": at, "peak": peak, "plan": plan} if plan else {"resets_at": at, "peak": peak}
+    def week(at, peak, keep=None):
+        stamp = plan or keep  # a reading with the plan unreadable keeps the week's own stamp
+        return {"resets_at": at, "peak": peak, "plan": stamp} if stamp else {"resets_at": at, "peak": peak}
     if current is None:
         return {"current": week(resets, pct), "closed": closed}, True
     # resets_at can wobble by a second between payloads; the same week is within an hour
@@ -385,7 +392,7 @@ def update_weeks(weeks, seven_day, plan=None):
             return weeks, False
         # a plan change mid-week: the window now measures the new plan, so the week is the new plan's
         peak = pct if plan and current.get("plan") not in (None, plan) else max(pct, current["peak"])
-        return {"current": week(current["resets_at"], peak), "closed": closed}, True
+        return {"current": week(current["resets_at"], peak, current.get("plan")), "closed": closed}, True
     if resets < current["resets_at"]:
         return weeks, False
     closed = [w for w in closed if abs(w["resets_at"] - current["resets_at"]) >= 3600] + [current]
@@ -413,7 +420,7 @@ def plan_fit(record, plans=None, suggest=True):
     would. 'down': all PLAN_WEEKS recent weeks are on file and a cheaper plan would have held
     every one; names the cheapest such."""
     plans = DEFAULT_PLANS if plans is None else plans
-    key = lambda name: str(name or "").split(" ")[0].lower()
+    key = plan_key
     mine = plans.get(key(record.get("plan")))
     limits = record.get("rate_limits") or {}
     spend = _number((limits.get("spend_limit") or {}).get("used_percentage"))
@@ -460,7 +467,7 @@ def _seg_plan(r, now=None, color=True):
     state, sign = ("red", "+") if direction == "up" else ("yellow", "\u2212")
     if other is None:
         return paint(f"{name} \u2191", state, color)
-    return paint(f"{name} \U0001F4A1 {other.title() if other.islower() else other} {sign}${diff:,.0f}/mo", state, color)
+    return paint(f"{name} \U0001F4A1 {" ".join(w.capitalize() if w.isalpha() else w for w in other.split())} {sign}${diff:,.0f}/mo", state, color)
 
 
 # The segments a line can show, in the order you list them. Each is a function of the record
